@@ -69,6 +69,7 @@ DATASETS = {
     "dff"    : ("./data/dff",     "parse_dff"),
     "ff++"   : ("./data/ff++",    "parse_ffpp"),
     "celebdf": ("./data/celebdf", "parse_celebdf"),
+    "hidf": ("./data/hidf", "parse_hidf"),
 }
 
 # ─────────────────────────────────────────────
@@ -152,6 +153,33 @@ def parse_ffpp(root: str):
     log.info(f"[FF++] {len(samples)} samples")
     return samples
 
+def parse_redface(root: str):
+    """
+    RedFace 구조:
+      root/
+        Original/   → real (label 0)
+        EFS/        → Entire Face Synthesis  (label 1)
+        FAM/        → Face Attribute Manipulation (label 1)
+        FR/         → Face Reenactment (label 1)
+        FS/         → Face Swapping (label 1)
+    """
+    samples, root = [], Path(root)
+
+    # 진짜
+    for ext in ["*.jpg", "*.jpeg", "*.png", "*.mp4"]:
+        for p in (root / "Original").rglob(ext):
+            samples.append((str(p), 0))
+
+    # 가짜 4종
+    for fake_dir in ["EFS", "FAM", "FR", "FS"]:
+        for ext in ["*.jpg", "*.jpeg", "*.png", "*.mp4"]:
+            for p in (root / fake_dir).rglob(ext):
+                samples.append((str(p), 1))
+
+    log.info(f"[RedFace] {len(samples)} samples  "
+             f"(real={sum(1 for _,l in samples if l==0)}, "
+             f"fake={sum(1 for _,l in samples if l==1)})")
+    return samples
 
 def parse_celebdf(root: str):
     samples, root = [], Path(root)
@@ -164,12 +192,45 @@ def parse_celebdf(root: str):
     log.info(f"[Celeb-DF] {len(samples)} samples")
     return samples
 
+def parse_hidf(root: str):
+    """
+    HIDF 구조:
+      root/
+        Real-vid/   *.mp4  → label 0
+        Fake-vid/   *.mp4  → label 1
+        Real-img/   *.jpg/*.png  → label 0
+        Fake-img/   *.jpg/*.png  → label 1
+    """
+    samples, root = [], Path(root)
+
+    # 영상
+    for p in (root / "Real-vid").glob("*.mp4"):
+        samples.append((str(p), 0))
+    for p in (root / "Fake-vid").glob("*.mp4"):
+        samples.append((str(p), 1))
+
+    # 이미지
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        for p in (root / "Real-img").glob(ext):
+            samples.append((str(p), 0))
+        for p in (root / "Fake-img").glob(ext):
+            samples.append((str(p), 1))
+
+    log.info(f"[HIDF] {len(samples)} samples  "
+             f"(real={sum(1 for _,l in samples if l==0)}, "
+             f"fake={sum(1 for _,l in samples if l==1)})")
+    return samples
+
+
+
 
 PARSERS = {
     "parse_dfdc"   : parse_dfdc,
     "parse_dff"    : parse_dff,
     "parse_ffpp"   : parse_ffpp,
     "parse_celebdf": parse_celebdf,
+    "parse_hidf" : parse_hidf,
+    "parse_RedFace" : parse_redface
 }
 
 
@@ -416,7 +477,6 @@ def save_sample(out_dir: Path, stem: str, face: np.ndarray,
     cv2.imwrite(str(out_dir / f"{stem}_face.jpg"), face,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
     np.save(str(out_dir / f"{stem}_lm.npy"),  lm)
-    np.save(str(out_dir / f"{stem}_dct.npy"), dct_map)
 
 
 # ─────────────────────────────────────────────
@@ -574,6 +634,13 @@ def run_pipeline(dataset_keys: list = None):
                 continue
 
             for file_path, label in tqdm(samples, desc=f"[{ds_key}]"):
+
+                check_stem = f"{Path(file_path).stem}_f000"
+                check_path = out_root / ds_key / str(label) / f"{check_stem}_dct.npy"
+
+                if check_path.exists():
+                    continue  # 이미 처리된 샘플이면 다음 영상으로 패스
+
                 frames = extract_frames(
                     file_path,
                     interval=CFG["frame_interval"],
