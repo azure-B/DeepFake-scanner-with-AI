@@ -122,7 +122,6 @@ def collect_samples(root: str, dataset: str, lm_suffix: str = None) -> list:
         for face_path in sorted(label_dir.glob("*_face.jpg")):
             stem     = face_path.stem.replace("_face", "")
             lm_path  = label_dir / f"{stem}{detected_suffix}"
-            dct_path = label_dir / f"{stem}_dct.npy"
 
             if lm_path.exists() and dct_path.exists():
                 samples.append((str(face_path), str(lm_path), str(dct_path), label))
@@ -225,27 +224,50 @@ def augment_face(face: tf.Tensor) -> tf.Tensor:
     face = tf.clip_by_value(face, 0.0, 1.0)
     return face
 
+def compute_dct_tf(face_tensor: tf.Tensor) -> tf.Tensor:
+    """
+    face_tensor: (224, 224, 3) float32, ImageNet 정규화 전 [0,1] 값
+    반환: (224, 224, 3) float32 [0, 1] — log-normalized DCT map
+    """
+    # 정규화 전 원본 픽셀 값 필요 → face를 [0,1]로 받아야 함
+    # make_load_fn 에서 DCT는 정규화 전에 계산
+    channels = tf.unstack(face_tensor, axis=-1)  # [R, G, B] 각각 (224,224)
+    dct_channels = []
+    for ch in channels:
+        # 행 방향 DCT
+        d = tf.signal.dct(ch, type=2, norm="ortho")
+        # 열 방향 DCT (전치 활용)
+        d = tf.signal.dct(tf.transpose(d), type=2, norm="ortho")
+        d = tf.transpose(d)
+        # 로그 스케일 + min-max 정규화
+        d = tf.math.log(tf.abs(d) + 1e-8)
+        d_min = tf.reduce_min(d)
+        d_max = tf.reduce_max(d)
+        d = (d - d_min) / (d_max - d_min + 1e-8)
+        dct_channels.append(d)
+    return tf.stack(dct_channels, axis=-1)
 
 def make_load_fn(split: str):
     do_aug = (split == "train")
 
-    def load_fn(face_p, lm_p, dct_p, label):
-        # ── 얼굴 이미지
+    def load_fn(face_p, lm_p, label):    # ← dct_p 인자 제거
+        # ── 얼굴 이미지 로드 ([0, 1] 상태 유지)
         raw  = tf.io.read_file(face_p)
         face = tf.image.decode_jpeg(raw, channels=3)
         face = tf.cast(face, tf.float32) / 255.0
+
         if do_aug:
             face = augment_face(face)
+
+        # ── DCT는 정규화 전 픽셀로 계산 (GPU에서 실시간)
+        dct = compute_dct_tf(face)
+        dct.set_shape([224, 224, 3])
+
+        # ── ImageNet 정규화 (DCT 계산 이후에 적용)
         face = (face - MEAN) / STD
         face.set_shape([224, 224, 3])
 
-        # ── DCT 맵
-        dct = tf.py_function(
-            lambda p: _load_npy(p, [224, 224, 3]), [dct_p], tf.float32
-        )
-        dct.set_shape([224, 224, 3])
-
-        # ── 랜드마크 (픽셀 좌표 → [0,1] 정규화)
+        # ── 랜드마크
         lm = tf.py_function(
             lambda p: (_load_npy(p, [68, 2]) / 224.0), [lm_p], tf.float32
         )
@@ -258,16 +280,15 @@ def make_load_fn(split: str):
 
     return load_fn
 
-
-def build_tf_dataset(samples: list, split: str, batch_size: int, seed: int) -> tf.data.Dataset:
+def build_tf_dataset(samples, split, batch_size, seed):
     face_paths = [s[0] for s in samples]
     lm_paths   = [s[1] for s in samples]
-    dct_paths  = [s[2] for s in samples]
-    labels     = [s[3] for s in samples]
+    labels     = [s[2] for s in samples]
 
     ds = tf.data.Dataset.from_tensor_slices(
-        (face_paths, lm_paths, dct_paths, labels)
+        (face_paths, lm_paths, labels)
     )
+
     load_fn = make_load_fn(split)
     ds = ds.map(load_fn, num_parallel_calls=tf.data.AUTOTUNE)
 
