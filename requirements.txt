@@ -1,0 +1,8 @@
+tensorflow==2.10.0
+mtcnn
+mediapipe==0.10.9
+protobuf==3.19.6
+opencv-python
+scipy
+numpy
+tqdm
