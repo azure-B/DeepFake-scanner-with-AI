@@ -123,8 +123,8 @@ def collect_samples(root: str, dataset: str, lm_suffix: str = None) -> list:
             stem     = face_path.stem.replace("_face", "")
             lm_path  = label_dir / f"{stem}{detected_suffix}"
 
-            if lm_path.exists() and dct_path.exists():
-                samples.append((str(face_path), str(lm_path), str(dct_path), label))
+            if lm_path.exists():
+                samples.append((str(face_path), str(lm_path), label))
 
     n_real = sum(1 for *_, l in samples if l == 0)
     n_fake = sum(1 for *_, l in samples if l == 1)
@@ -180,8 +180,8 @@ def undersample_fake(samples: list, ratio: float, seed: int) -> list:
     fake를 real * ratio 개수로 줄임.
     ratio=3.0 → real 80K, fake 240K → 총 320K
     """
-    real = [s for s in samples if s[3] == 0]
-    fake = [s for s in samples if s[3] == 1]
+    real = [s for s in samples if s[2] == 0]
+    fake = [s for s in samples if s[2] == 1]
     target = int(len(real) * ratio)
 
     if target >= len(fake):
@@ -508,14 +508,19 @@ class BackboneUnfreezeCallback(keras.callbacks.Callback):
             for layer in self.model.layers:
                 if hasattr(layer, "trainable"):
                     layer.trainable = True
-            # 현재 lr 가져와서 축소
-            old_lr = float(self.model.optimizer.learning_rate)
-            new_lr = old_lr * self.lr_scale
-            self.model.optimizer.learning_rate.assign(new_lr)
+
+            # ✅ 현재 step에서 스케줄 값 계산
+            current_step = self.model.optimizer.iterations
+            current_lr = self.model.optimizer.learning_rate(current_step)
+            new_lr = float(current_lr) * self.lr_scale
+
+            # ✅ 스케줄 → 고정 float으로 교체 (.assign() 아님)
+            self.model.optimizer.learning_rate = new_lr
+
             self._unfrozen = True
             log.info(
                 f"Epoch {epoch}: backbone unfreeze. "
-                f"lr {old_lr:.2e} → {new_lr:.2e}"
+                f"lr {float(current_lr):.2e} → {new_lr:.2e}"
             )
 
 
@@ -565,12 +570,12 @@ def build_callbacks(cfg: dict, steps_per_epoch: int) -> list:
         # ── LR 로깅 (디버깅용)
         keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: log.info(
-                f"Epoch {epoch+1:3d} │ "
-                f"loss={logs.get('loss',0):.4f}  "
-                f"auc={logs.get('auc',0):.4f}  "
-                f"val_loss={logs.get('val_loss',0):.4f}  "
-                f"val_auc={logs.get('val_auc',0):.4f}  "
-                f"lr={float(model.optimizer.learning_rate):.2e}"
+                f"Epoch {epoch + 1:3d} │ "
+                f"loss={logs.get('loss', 0):.4f}  "
+                f"auc={logs.get('auc', 0):.4f}  "
+                f"val_loss={logs.get('val_loss', 0):.4f}  "
+                f"val_auc={logs.get('val_auc', 0):.4f}  "
+                f"lr={float(model.optimizer.learning_rate(model.optimizer.iterations)) if callable(model.optimizer.learning_rate) else float(model.optimizer.learning_rate):.2e}"
             )
         ),
     ]

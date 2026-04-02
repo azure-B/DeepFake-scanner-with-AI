@@ -1,7 +1,7 @@
 """
 Unified Deepfake Detection Preprocessing Pipeline
 지원 데이터셋: DFDC, DeepFakeFace(DFF), FF++, Celeb-DF v2
-프레임워크: TensorFlow (DCT GPU 연산)
+프레임워크: TensorFlow
 얼굴 검출: OpenCV DNN YuNet (MTCNN TFLite hang 완전 대체)
 랜드마크: MediaPipe FaceMesh (CPU)
 
@@ -65,11 +65,11 @@ CFG = {
 }
 
 DATASETS = {
-    "dfdc"   : ("./data/dfdc",    "parse_dfdc"),
     "dff"    : ("./data/dff",     "parse_dff"),
-    "ff++"   : ("./data/ff++",    "parse_ffpp"),
+    "ffpp"   : ("./data/ff++",    "parse_ffpp"),
     "celebdf": ("./data/celebdf", "parse_celebdf"),
     "hidf": ("./data/hidf", "parse_hidf"),
+    "redface": ("./data/redface", "parse_redface"),
 }
 
 # ─────────────────────────────────────────────
@@ -112,26 +112,6 @@ MP_REGIONS = {
 # 1. LABEL PARSERS
 # ─────────────────────────────────────────────
 
-def parse_dfdc(root: str):
-    samples, root = [], Path(root)
-    meta_path = root / "metadata.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            meta = json.load(f)
-        for fname, info in meta.items():
-            label = 1 if info.get("label", "").upper() == "FAKE" else 0
-            fpath = root / fname
-            if fpath.exists():
-                samples.append((str(fpath), label))
-    else:
-        for label, folder in [(0, "real"), (1, "fake")]:
-            for p in (root / folder).glob("*"):
-                if p.suffix.lower() in {".mp4", ".jpg", ".png"}:
-                    samples.append((str(p), label))
-    log.info(f"[DFDC] {len(samples)} samples")
-    return samples
-
-
 def parse_dff(root: str):
     samples, root = [], Path(root)
     for p in (root / "real").rglob("*.jpg"):
@@ -145,12 +125,16 @@ def parse_dff(root: str):
 
 def parse_ffpp(root: str):
     samples, root = [], Path(root)
-    for p in (root / "original_sequences/youtube/c23/videos").glob("*.mp4"):
-        samples.append((str(p), 0))
+
+    for method in ["youtube","actors"]:
+        for p in (root / f"original_sequences/{method}/c40/videos").glob("*.mp4"):
+            samples.append((str(p), 0))
+
     for method in ["Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"]:
-        for p in (root / f"manipulated_sequences/{method}/c23/videos").glob("*.mp4"):
+        for p in (root / f"manipulated_sequences/{method}/c40/videos").glob("*.mp4"):
             samples.append((str(p), 1))
     log.info(f"[FF++] {len(samples)} samples")
+
     return samples
 
 def parse_redface(root: str):
@@ -225,12 +209,11 @@ def parse_hidf(root: str):
 
 
 PARSERS = {
-    "parse_dfdc"   : parse_dfdc,
     "parse_dff"    : parse_dff,
     "parse_ffpp"   : parse_ffpp,
     "parse_celebdf": parse_celebdf,
     "parse_hidf" : parse_hidf,
-    "parse_RedFace" : parse_redface
+    "parse_redFace" : parse_redface
 }
 
 
@@ -430,49 +413,12 @@ class LandmarkExtractor:
     def close(self):
         self.face_mesh.close()
 
-
-# ─────────────────────────────────────────────
-# 5. DCT MAP — 완전 벡터화 (TF GPU 연속 실행)
-# ─────────────────────────────────────────────
-
-def compute_dct_map(bgr_face: np.ndarray) -> np.ndarray:
-    """
-    BGR (H, W, 3) → 2D-DCT → log-scale 정규화 → (224, 224, 3) float32 [0, 1]
-
-    변경점 (구버전 대비):
-    - 채널 루프 제거 → 한 번에 텐서 올림
-    - .numpy() 호출을 최종 1회로 축소 (GPU↔CPU 왕복 최소화)
-    - tf.signal.dct는 마지막 차원에 적용 → transpose로 행/열 방향 순차 처리
-    """
-    rgb = cv2.cvtColor(bgr_face, cv2.COLOR_BGR2RGB).astype(np.float32)
-
-    t = tf.constant(rgb)                               # (H, W, 3)
-    t = tf.transpose(t, [2, 0, 1])                    # (3, H, W)
-
-    # 행 방향 DCT
-    d = tf.signal.dct(t, type=2, norm="ortho")
-    # 열 방향 DCT (전치 후 DCT → 복원)
-    d = tf.signal.dct(tf.transpose(d, [0, 2, 1]), type=2, norm="ortho")
-    d = tf.transpose(d, [0, 2, 1])                    # (3, H, W) 복원
-    d = tf.transpose(d, [1, 2, 0])                    # (H, W, 3)
-
-    # log 정규화
-    d  = tf.math.log(tf.abs(d) + 1e-8)
-
-    # 채널별 min-max 정규화
-    lo = tf.reduce_min(d, axis=[0, 1], keepdims=True)  # (1, 1, 3)
-    hi = tf.reduce_max(d, axis=[0, 1], keepdims=True)
-    d  = (d - lo) / (hi - lo + 1e-8)
-
-    return d.numpy()                                   # 최종 1회만 CPU로
-
-
 # ─────────────────────────────────────────────
 # 6. SAVE UTILS
 # ─────────────────────────────────────────────
 
 def save_sample(out_dir: Path, stem: str, face: np.ndarray,
-                lm: np.ndarray, dct_map: np.ndarray):
+                lm: np.ndarray):
     out_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_dir / f"{stem}_face.jpg"), face,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -494,7 +440,6 @@ def build_tf_dataset(processed_root: str, split: str = "train",
     --------------
     {
       "face"    : (B, 224, 224, 3)  float32  — ImageNet 정규화 RGB
-      "dct"     : (B, 224, 224, 3)  float32  — DCT 맵
       "landmark": (B, 68, 2)        float32  — 0~1 정규화 좌표
     },
     labels : (B,) int32
@@ -513,10 +458,9 @@ def build_tf_dataset(processed_root: str, split: str = "train",
             for face_path in sorted(label_dir.glob("*_face.jpg")):
                 stem     = face_path.stem.replace("_face", "")
                 lm_path  = label_dir / f"{stem}_lm.npy"
-                dct_path = label_dir / f"{stem}_dct.npy"
-                if lm_path.exists() and dct_path.exists():
+                if lm_path.exists():
                     all_samples.append((
-                        str(face_path), str(lm_path), str(dct_path), label
+                        str(face_path), str(lm_path), label
                     ))
 
     if not all_samples:
@@ -548,32 +492,26 @@ def build_tf_dataset(processed_root: str, split: str = "train",
     def _load_npy(path_tensor):
         return np.load(path_tensor.numpy().decode("utf-8")).astype(np.float32)
 
-    def load_sample(face_p, lm_p, dct_p, label):
+    def load_sample(face_p, lm_p, label):
         # ── 얼굴 이미지 ──────────────────────────────────────────────────────
         face = tf.image.decode_jpeg(tf.io.read_file(face_p), channels=3)
         face = (tf.cast(face, tf.float32) / 255.0 - mean) / std   # (224,224,3)
-
-        # ── DCT 맵 ───────────────────────────────────────────────────────────
-        dct_arr = tf.py_function(_load_npy, [dct_p], tf.float32)
-        dct_arr.set_shape([224, 224, 3])
-
         # ── 랜드마크 ─────────────────────────────────────────────────────────
         lm = tf.py_function(_load_npy, [lm_p], tf.float32)
         lm.set_shape([68, 2])
         lm = lm / 224.0    # 픽셀 → [0, 1] 정규화
 
         return (
-            {"face": face, "dct": dct_arr, "landmark": lm},
+            {"face": face, "landmark": lm},
             tf.cast(label, tf.int32),
         )
 
     face_paths = [s[0] for s in chosen]
     lm_paths   = [s[1] for s in chosen]
-    dct_paths  = [s[2] for s in chosen]
-    labels     = [s[3] for s in chosen]
+    labels     = [s[2] for s in chosen]
 
     ds = tf.data.Dataset.from_tensor_slices(
-        (face_paths, lm_paths, dct_paths, labels)
+        (face_paths, lm_paths, labels)
     )
 
     # ── train: 클래스 균형 가중 셔플 ────────────────────────────────────────
@@ -621,6 +559,14 @@ def run_pipeline(dataset_keys: list = None):
     out_root    = Path(CFG["output_root"])
     total_saved = 0
 
+    # ✅ 추가 — 이미 처리된 stem 전체를 set으로 미리 수집
+    log.info("기처리 샘플 스캔 중...")
+    done_stems = set()
+    for existing in out_root.rglob("*_lm.npy"):
+        # {stem}_lm.npy → stem 추출
+        done_stems.add(existing.stem.replace("_lm", ""))
+    log.info(f"기처리 샘플: {len(done_stems):,}개")
+
     try:
         for ds_key in dataset_keys:
             root, parser_name = DATASETS[ds_key]
@@ -636,10 +582,9 @@ def run_pipeline(dataset_keys: list = None):
             for file_path, label in tqdm(samples, desc=f"[{ds_key}]"):
 
                 check_stem = f"{Path(file_path).stem}_f000"
-                check_path = out_root / ds_key / str(label) / f"{check_stem}_dct.npy"
 
-                if check_path.exists():
-                    continue  # 이미 처리된 샘플이면 다음 영상으로 패스
+                if check_stem in done_stems:  # ← 이 줄로
+                    continue
 
                 frames = extract_frames(
                     file_path,
@@ -658,13 +603,11 @@ def run_pipeline(dataset_keys: list = None):
                     # 랜드마크 추출
                     lm, _ = extractor.extract(face)
 
-                    # DCT 맵 (TF GPU)
-                    dct_map = compute_dct_map(face)
 
                     # 저장
                     stem    = f"{Path(file_path).stem}_f{fi:03d}"
                     out_dir = out_root / ds_key / str(label)
-                    save_sample(out_dir, stem, face, lm, dct_map)
+                    save_sample(out_dir, stem, face, lm)
                     total_saved += 1
 
             # 랜드마크 실패율 경고
@@ -711,7 +654,7 @@ if __name__ == "__main__":
         )
 
     # ── 전처리 실행 ──────────────────────────────────────────────────────────
-    processed_root = run_pipeline(dataset_keys=["celebdf"])
+    processed_root = run_pipeline(dataset_keys=["celebdf","ffpp","hidf","redface","dff"])
 
     # ── tf.data 검증 ─────────────────────────────────────────────────────────
     if not any(Path(processed_root).rglob("*_face.jpg")):
@@ -721,7 +664,6 @@ if __name__ == "__main__":
         train_ds = build_tf_dataset(processed_root, split="train", batch_size=8)
         for batch, lbls in train_ds.take(1):
             print(f"  face     : {batch['face'].shape}")      # (8, 224, 224, 3)
-            print(f"  dct      : {batch['dct'].shape}")       # (8, 224, 224, 3)
             print(f"  landmark : {batch['landmark'].shape}")  # (8, 68, 2)
             print(f"  labels   : {lbls.numpy()}")
         log.info("tf.data 정상 동작 ✓")
