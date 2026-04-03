@@ -94,7 +94,7 @@ CFG = {
 
     # ── 저장
     "ckpt_dir"         : "./checkpoints",
-    "log_dir"          : "./logs",
+    # "log_dir"          : "./logs",
 }
 
 MEAN = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
@@ -606,7 +606,7 @@ def _get_lr():
 
 def build_callbacks(cfg: dict) -> list:
     os.makedirs(cfg["ckpt_dir"], exist_ok=True)
-    os.makedirs(cfg["log_dir"], exist_ok=True)
+    # os.makedirs(cfg["log_dir"], exist_ok=True)
 
     return [
         keras.callbacks.ModelCheckpoint(
@@ -617,7 +617,7 @@ def build_callbacks(cfg: dict) -> list:
             monitor           = "val_auc",
             mode              = "max",
             save_best_only    = True,
-            save_weights_only = False,
+            save_weights_only = True,
             verbose           = 1,
         ),
         keras.callbacks.EarlyStopping(
@@ -627,15 +627,15 @@ def build_callbacks(cfg: dict) -> list:
             restore_best_weights = True,
             verbose              = 1,
         ),
-        keras.callbacks.TensorBoard(
-            log_dir      = cfg["log_dir"],
-            histogram_freq = 0,
-            update_freq  = "epoch",
-        ),
-        keras.callbacks.CSVLogger(
-            filename = f"training_log_{_ts}.csv",
-            append   = False,
-        ),
+        # keras.callbacks.TensorBoard(
+        #     log_dir      = cfg["log_dir"],
+        #     histogram_freq = 0,
+        #     update_freq  = "epoch",
+        # ),
+        # keras.callbacks.CSVLogger(
+        #     filename = f"training_log_{_ts}.csv",
+        #     append   = False,
+        # ),
         BackboneUnfreezeCallback(
             unfreeze_epoch = cfg["unfreeze_epoch"],
             lr_scale       = 0.1,
@@ -697,18 +697,18 @@ def evaluate_model(model: keras.Model, test_ds: tf.data.Dataset,
             "precision": precision, "recall": recall, "f1": f1}
 
 
-def sanity_check(ds: tf.data.Dataset):
-    log.info("─" * 50)
-    for inputs, labels in ds.take(1):
-        face = inputs["face"]
-        dct  = inputs["dct"]
-        lm   = inputs["lm"]
-        log.info(f"  face  {face.shape}  [{float(tf.reduce_min(face)):.2f}, {float(tf.reduce_max(face)):.2f}]")
-        log.info(f"  dct   {dct.shape}   [{float(tf.reduce_min(dct)):.2f}, {float(tf.reduce_max(dct)):.2f}]")
-        log.info(f"  lm    {lm.shape}    [{float(tf.reduce_min(lm)):.4f}, {float(tf.reduce_max(lm)):.4f}]")
-        log.info(f"  labels {labels.numpy()}")
-    log.info("Sanity check 완료")
-    log.info("─" * 50)
+# def sanity_check(ds: tf.data.Dataset):
+#     log.info("─" * 50)
+#     for inputs, labels in ds.take(1):
+#         face = inputs["face"]
+#         dct  = inputs["dct"]
+#         lm   = inputs["lm"]
+#         log.info(f"  face  {face.shape}  [{float(tf.reduce_min(face)):.2f}, {float(tf.reduce_max(face)):.2f}]")
+#         log.info(f"  dct   {dct.shape}   [{float(tf.reduce_min(dct)):.2f}, {float(tf.reduce_max(dct)):.2f}]")
+#         log.info(f"  lm    {lm.shape}    [{float(tf.reduce_min(lm)):.4f}, {float(tf.reduce_max(lm)):.4f}]")
+#         log.info(f"  labels {labels.numpy()}")
+#     log.info("Sanity check 완료")
+#     log.info("─" * 50)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -757,6 +757,7 @@ def main():
     log.info("STEP 5: tf.data 파이프라인 빌드")
     log.info("=" * 60)
     bs       = cfg["batch_size"]
+
     train_ds = build_tf_dataset(splits["train"],    "train", bs, seed)
     val_ds   = build_tf_dataset(splits["val"],      "val",   bs, seed)
     # 내부 test (train 데이터셋 출신)
@@ -764,7 +765,7 @@ def main():
     # 외부 test (CelebDF / redface / Eval-2024)
     ext_test_ds = build_tf_dataset(ext_test_samples,"test",  bs, seed)
 
-    sanity_check(train_ds)
+    # sanity_check(train_ds)
 
     # ── STEP 6: 모델 빌드
     log.info("=" * 60)
