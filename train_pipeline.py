@@ -25,7 +25,6 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, mixed_precision
-import tensorflow_addons as tfa
 
 # ── 로깅
 _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -495,13 +494,15 @@ def build_model(cfg: dict) -> keras.Model:
 
     x = layers.Concatenate(name="concat")([rgb_feat, dct_feat, lm_feat])
 
+    wd = cfg["weight_decay"]
+    reg = keras.regularizers.l2(wd)
     for units in cfg["fusion_hidden"]:
-        x = layers.Dense(units, use_bias=False)(x)
+        x = layers.Dense(units, use_bias=False, kernel_regularizer=reg)(x)
         x = layers.BatchNormalization()(x)
         x = layers.Activation("relu")(x)
         x = layers.Dropout(cfg["dropout_rate"])(x)
 
-    out = layers.Dense(1, name="logit")(x)
+    out = layers.Dense(1, name="logit", kernel_regularizer=reg)(x)
     out = layers.Activation("sigmoid", dtype="float32", name="prob")(out)
 
     model = keras.Model(
@@ -516,12 +517,12 @@ def build_model(cfg: dict) -> keras.Model:
 # ═══════════════════════════════════════════════════════════════
 # 5. Focal Loss
 # ═══════════════════════════════════════════════════════════════
-
+@keras.utils.register_keras_serializable(package="deepfake")
 class FocalLoss(keras.losses.Loss):
     def __init__(self, alpha=0.75, gamma=2.0, **kwargs):
         super().__init__(**kwargs)
-        self.alpha = alpha
-        self.gamma = gamma
+        self.alpha = float(alpha)
+        self.gamma = float(gamma)
 
     def call(self, y_true, y_pred):
         y_true  = tf.cast(y_true, tf.float32)
@@ -534,7 +535,7 @@ class FocalLoss(keras.losses.Loss):
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update({"alpha": self.alpha, "gamma": self.gamma})
+        cfg.update({"alpha": float(self.alpha), "gamma": float(self.gamma)})
         return cfg
 
 
@@ -542,6 +543,7 @@ class FocalLoss(keras.losses.Loss):
 # 6. 스케줄러
 # ═══════════════════════════════════════════════════════════════
 
+@keras.utils.register_keras_serializable(package="deepfake")
 class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
     def __init__(self, lr_init, lr_min, warmup_steps, total_steps):
         super().__init__()
@@ -563,10 +565,10 @@ class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
 
     def get_config(self):
         return {
-            "lr_init"      : self.lr_init,
-            "lr_min"       : self.lr_min,
-            "warmup_steps" : self.warmup_steps,
-            "total_steps"  : self.total_steps,
+            "lr_init"      : float(self.lr_init),
+            "lr_min"       : float(self.lr_min),
+            "warmup_steps" : int(self.warmup_steps),
+            "total_steps"  : int(self.total_steps),
         }
 
 
@@ -596,6 +598,11 @@ class BackboneUnfreezeCallback(keras.callbacks.Callback):
             log.info(f"Epoch {epoch}: backbone unfreeze. "
                      f"lr {float(current_lr):.2e} → {new_lr:.2e}")
 
+def _get_lr():
+    lr = model.optimizer.learning_rate
+    if callable(lr):
+        return float(lr(model.optimizer.iterations).numpy())
+    return float(lr)
 
 def build_callbacks(cfg: dict) -> list:
     os.makedirs(cfg["ckpt_dir"], exist_ok=True)
@@ -605,7 +612,7 @@ def build_callbacks(cfg: dict) -> list:
         keras.callbacks.ModelCheckpoint(
             filepath          = os.path.join(
                 cfg["ckpt_dir"],
-                "best_auc_epoch{epoch:03d}_val{val_auc:.4f}.keras"
+                "best_auc_epoch{epoch:03d}_val{val_auc:.4f}"
             ),
             monitor           = "val_auc",
             mode              = "max",
@@ -640,7 +647,7 @@ def build_callbacks(cfg: dict) -> list:
                 f"auc={logs.get('auc',0):.4f}  "
                 f"val_loss={logs.get('val_loss',0):.4f}  "
                 f"val_auc={logs.get('val_auc',0):.4f}  "
-                f"lr={ float(model.optimizer.learning_rate(model.optimizer.iterations)) if callable(model.optimizer.learning_rate) else float(model.optimizer.learning_rate) :.2e}"
+                f"lr={_get_lr():.2e}"
             )
         ),
     ]
@@ -776,9 +783,9 @@ def main():
 
     schedule  = WarmupCosineDecay(cfg["lr_init"], cfg["lr_min"],
                                    int(warmup_steps), int(total_steps))
-    optimizer = tfa.optimizers.AdamW(
+    optimizer = tf.keras.optimizers.Adam(
         learning_rate=schedule,
-        weight_decay=cfg["weight_decay"],
+        clipnorm=1.0,
     )
     model.compile(
         optimizer = optimizer,
@@ -799,6 +806,9 @@ def main():
     log.info("=" * 60)
     t0      = time.time()
     history = model.fit(
+        # 디버깅용
+        # train_ds.take(1000),
+        # validation_data=val_ds.take(1000),
         train_ds,
         validation_data = val_ds,
         epochs          = cfg["epochs"],
@@ -817,7 +827,7 @@ def main():
                                  tag="External Test (CelebDF/redface/Eval-2024)")
 
     # ── STEP 10: 저장
-    final_path = os.path.join(cfg["ckpt_dir"], f"final_model_{_ts}.keras")
+    final_path = os.path.join(cfg["ckpt_dir"], f"final_model_{_ts}")
     model.save(final_path)
     log.info(f"최종 모델 저장: {final_path}")
 
