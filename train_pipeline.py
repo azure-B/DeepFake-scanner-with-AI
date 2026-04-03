@@ -1,9 +1,20 @@
 """
-Deepfake Detection — 3-Stream Training Pipeline
-데이터셋 : processed/celebdf/  (real 80K  /  fake 500K)
-모델     : RGB(EfficientNetB4) + DCT(CNN) + LM(MLP) → Late Fusion
-불균형   : Focal Loss (α=0.75, γ=2) + fake 언더샘플(3×real)
-분할     : 영상 ID 단위 7:1:2  →  data leakage 방지
+Deepfake Detection — 3-Stream Training Pipeline (v2)
+─────────────────────────────────────────────────────
+변경사항:
+  1. LM Branch: (68,2) 절대좌표 → (34,) 기하학적 비율 피처
+     - 눈/코/입 비율, 좌우 대칭성, 얼굴 종횡비 등
+     - HIDF/redface 도메인에서도 의미 있는 신호 추출 가능
+  2. 데이터셋 역할 분리
+     - Train : FF++ + DFF + HIDF
+     - Test  : CelebDF + redface + Deepfake-Eval-2024 (학습 절대 불포함)
+  3. 도메인 핑거프린트 방지
+     - 완전 랜덤 셔플 (buffer_size=10000)
+  4. LM 임베딩 64 → 32차원으로 축소
+
+모델: RGB(EfficientNetB4) + DCT(CNN) + LM(MLP) → Late Fusion
+불균형: Focal Loss (α=0.75, γ=2) + fake 언더샘플(3×real)
+분할: 영상 ID 단위 7:1:2 → data leakage 방지
 """
 
 import os, sys, re, time, logging
@@ -14,8 +25,9 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, mixed_precision
+import tensorflow_addons as tfa
 
-# ── 로깅 설정
+# ── 로깅
 _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 logging.basicConfig(
     level=logging.INFO,
@@ -33,9 +45,9 @@ for gpu in gpus:
     tf.config.experimental.set_memory_growth(gpu, True)
 log.info(f"GPU {len(gpus)}개 감지")
 
-# Mixed precision (Ampere/Turing 이상 권장)
 mixed_precision.set_global_policy("mixed_float16")
 log.info(f"compute dtype: {mixed_precision.global_policy().compute_dtype}")
+
 
 # ═══════════════════════════════════════════════════════════════
 # 0. CONFIG
@@ -43,22 +55,25 @@ log.info(f"compute dtype: {mixed_precision.global_policy().compute_dtype}")
 CFG = {
     # ── 데이터
     "processed_root"   : "./processed",
-    "dataset"          : "celebdf",
-    "lm_suffix"        : None,       # None → 자동 감지 (_lm.npy 또는 _im.npy)
+
+    # ── 역할 분리
+    # Train/Val 에만 사용 (도메인 핑거프린트 방지)
+    "train_datasets"   : ["ffpp", "dff", "hidf"],
+    # Test 전용 (학습에 절대 포함 X)
+    "test_datasets"    : ["celebdf", "redface"],
 
     # ── 불균형
-    "undersample_ratio": 3.0,        # fake = real * ratio  (None → 사용 안 함)
+    "undersample_ratio": 3.0,        # fake = real * ratio
 
     # ── 이미지
     "img_size"         : 224,
 
     # ── 모델
-    "backbone"         : "EfficientNetB4",
-    "freeze_backbone"  : True,       # True: backbone frozen (feature extractor 모드)
-    "unfreeze_epoch"   : 10,         # 이 epoch부터 backbone 전체 unfreeze
+    "freeze_backbone"  : True,
+    "unfreeze_epoch"   : 10,
     "rgb_embed_dim"    : 256,
     "dct_embed_dim"    : 128,
-    "lm_embed_dim"     : 64,
+    "lm_embed_dim"     : 32,         # 64 → 32로 축소 (기하학적 피처 34차원에 맞게)
     "fusion_hidden"    : [512, 256],
     "dropout_rate"     : 0.4,
 
@@ -71,10 +86,10 @@ CFG = {
     "weight_decay"     : 1e-4,
 
     # ── Focal Loss
-    "focal_alpha"      : 0.75,       # real(소수 클래스) 가중치
+    "focal_alpha"      : 0.75,
     "focal_gamma"      : 2.0,
 
-    # ── 분할 (영상 ID 단위)
+    # ── 분할
     "split_ratio"      : (0.7, 0.1, 0.2),
     "seed"             : 42,
 
@@ -86,70 +101,179 @@ CFG = {
 MEAN = tf.constant([0.485, 0.456, 0.406], dtype=tf.float32)
 STD  = tf.constant([0.229, 0.224, 0.225], dtype=tf.float32)
 
+# LM 기하학적 피처 차원 (변경 시 build_lm_branch도 함께 수정)
+LM_FEAT_DIM = 34
+
 
 # ═══════════════════════════════════════════════════════════════
-# 1. 데이터 수집
+# 1. 기하학적 랜드마크 피처 추출
 # ═══════════════════════════════════════════════════════════════
 
-def _detect_lm_suffix(label_dir: Path) -> str:
-    """_lm.npy 또는 _im.npy 중 실제 존재하는 suffix 자동 감지"""
-    for suffix in ("_lm.npy", "_im.npy"):
-        if next(label_dir.glob(f"*{suffix}"), None) is not None:
-            log.info(f"랜드마크 suffix 감지: {suffix}")
-            return suffix
-    raise FileNotFoundError(f"{label_dir} 에서 _lm.npy/_im.npy 파일을 찾을 수 없음")
+def extract_geometric_features(lm: np.ndarray) -> np.ndarray:
+    """
+    (68, 2) 절대 픽셀 좌표 → (34,) 기하학적 비율 피처
+
+    절대좌표 대신 비율/대칭성을 사용하므로:
+    - 얼굴 크기·위치 불변
+    - HIDF/RedFace처럼 랜드마크가 자연스러운 경우에도
+      미세한 기하학적 비일관성 검출 가능
+
+    dlib 68점 인덱스 기준:
+      0-16 : 얼굴 외곽
+      17-21: 왼쪽 눈썹 / 22-26: 오른쪽 눈썹
+      27-35: 코 / 36-41: 왼쪽 눈 / 42-47: 오른쪽 눈
+      48-67: 입
+    """
+    feats = []
+
+    # ── 기준값: 얼굴 너비 (외곽 0번 ↔ 16번)
+    face_w = float(np.linalg.norm(lm[16] - lm[0])) + 1e-8
+    # 얼굴 높이 (턱 끝 8번 ↔ 미간 27번)
+    face_h = float(np.linalg.norm(lm[8] - lm[27])) + 1e-8
+
+    # ── 1. 얼굴 종횡비
+    feats.append(face_h / face_w)                                   # 1
+
+    # ── 2. 눈 관련 (6개)
+    eye_dist  = float(np.linalg.norm(lm[42] - lm[36]))             # 눈 간격
+    eye_l_h   = float(np.linalg.norm(lm[41] - lm[37]))             # 왼눈 높이
+    eye_r_h   = float(np.linalg.norm(lm[47] - lm[43]))             # 오른눈 높이
+    eye_l_w   = float(np.linalg.norm(lm[39] - lm[36]))             # 왼눈 너비
+    eye_r_w   = float(np.linalg.norm(lm[45] - lm[42]))             # 오른눈 너비
+    feats.append(eye_dist / face_w)                                 # 2
+    feats.append(eye_l_h / (eye_r_h + 1e-8))                       # 3 대칭성
+    feats.append(eye_l_w / (eye_r_w + 1e-8))                       # 4 대칭성
+    feats.append(eye_l_h / (eye_l_w + 1e-8))                       # 5 왼눈 종횡비
+    feats.append(eye_r_h / (eye_r_w + 1e-8))                       # 6 오른눈 종횡비
+    feats.append(eye_dist / face_h)                                 # 7
+
+    # ── 3. 눈썹 관련 (4개)
+    brow_l_h = float(np.linalg.norm(lm[19] - lm[38]))              # 왼눈썹-눈 거리
+    brow_r_h = float(np.linalg.norm(lm[24] - lm[44]))              # 오른눈썹-눈 거리
+    brow_l_w = float(np.linalg.norm(lm[21] - lm[17]))              # 왼눈썹 너비
+    brow_r_w = float(np.linalg.norm(lm[26] - lm[22]))              # 오른눈썹 너비
+    feats.append(brow_l_h / face_h)                                 # 8
+    feats.append(brow_r_h / face_h)                                 # 9
+    feats.append(brow_l_h / (brow_r_h + 1e-8))                     # 10 대칭성
+    feats.append(brow_l_w / (brow_r_w + 1e-8))                     # 11 대칭성
+
+    # ── 4. 코 관련 (4개)
+    nose_h   = float(np.linalg.norm(lm[33] - lm[27]))              # 코 길이
+    nose_w   = float(np.linalg.norm(lm[35] - lm[31]))              # 코 너비
+    nose_tip = float(np.linalg.norm(lm[33] - lm[30]))              # 코끝 처짐
+    feats.append(nose_h / face_h)                                   # 12
+    feats.append(nose_w / face_w)                                   # 13
+    feats.append(nose_h / (nose_w + 1e-8))                         # 14 종횡비
+    feats.append(nose_tip / nose_h)                                 # 15
+
+    # ── 5. 입 관련 (6개)
+    mouth_w  = float(np.linalg.norm(lm[54] - lm[48]))              # 입 너비
+    mouth_h  = float(np.linalg.norm(lm[57] - lm[51]))              # 입 높이
+    upper_h  = float(np.linalg.norm(lm[51] - lm[62]))              # 윗입술 두께
+    lower_h  = float(np.linalg.norm(lm[66] - lm[57]))              # 아랫입술 두께
+    mouth_l  = float(np.linalg.norm(lm[48] - lm[8]))               # 왼쪽 입꼬리-턱
+    mouth_r  = float(np.linalg.norm(lm[54] - lm[8]))               # 오른쪽 입꼬리-턱
+    feats.append(mouth_w / face_w)                                  # 16
+    feats.append(mouth_h / face_h)                                  # 17
+    feats.append(mouth_w / (mouth_h + 1e-8))                       # 18 종횡비
+    feats.append(upper_h / (lower_h + 1e-8))                       # 19 입술 대칭
+    feats.append(mouth_l / (mouth_r + 1e-8))                       # 20 좌우 대칭
+    feats.append(mouth_w / (eye_dist + 1e-8))                      # 21 입/눈 비율
+
+    # ── 6. 얼굴 전체 비율 (4개)
+    jaw_l    = float(np.linalg.norm(lm[4]  - lm[0]))               # 왼쪽 턱선
+    jaw_r    = float(np.linalg.norm(lm[12] - lm[16]))              # 오른쪽 턱선
+    chin_l   = float(np.linalg.norm(lm[8]  - lm[4]))               # 왼쪽 턱 하단
+    chin_r   = float(np.linalg.norm(lm[8]  - lm[12]))              # 오른쪽 턱 하단
+    feats.append(jaw_l / (jaw_r + 1e-8))                           # 22 대칭성
+    feats.append(chin_l / (chin_r + 1e-8))                         # 23 대칭성
+    feats.append((jaw_l + jaw_r) / face_w)                         # 24
+    feats.append((chin_l + chin_r) / face_h)                       # 25
+
+    # ── 7. 눈-입-코 삼각형 비율 (4개)
+    eye_mid  = (lm[39] + lm[45]) / 2                               # 두 눈 중심
+    nose_tip_pt = lm[33]
+    mouth_mid   = (lm[48] + lm[54]) / 2
+    tri_h    = float(np.linalg.norm(nose_tip_pt - eye_mid))
+    tri_b    = float(np.linalg.norm(mouth_mid  - nose_tip_pt))
+    tri_asym = float(np.linalg.norm(eye_mid    - nose_tip_pt))
+    feats.append(tri_h  / face_h)                                  # 26
+    feats.append(tri_b  / face_h)                                  # 27
+    feats.append(tri_h  / (tri_b + 1e-8))                         # 28
+    feats.append(tri_asym / face_w)                                # 29
+
+    # ── 8. 좌우 전체 대칭 점수 (5개)
+    # 좌우 대응점 거리 평균 (대칭이면 0에 가까움)
+    sym_pairs = [(0,16),(1,15),(2,14),(3,13),(4,12)]
+    for l, r in sym_pairs:
+        # 얼굴 중심선 기준 좌우 x 거리 비율
+        center_x = (lm[0][0] + lm[16][0]) / 2
+        diff = abs(abs(lm[l][0] - center_x) - abs(lm[r][0] - center_x))
+        feats.append(diff / face_w)                                # 30~34
+
+    arr = np.array(feats[:LM_FEAT_DIM], dtype=np.float32)
+    return arr
 
 
-def collect_samples(root: str, dataset: str, lm_suffix: str = None) -> list:
+# ═══════════════════════════════════════════════════════════════
+# 2. 데이터 수집
+# ═══════════════════════════════════════════════════════════════
+
+def collect_samples(processed_root: str, dataset_keys: list) -> list:
     """
-    processed/{dataset}/{0,1}/ 스캔 → (face, lm, dct, label) 리스트 반환
-    lm_suffix=None 이면 자동 감지
+    processed/{dataset}/{0,1}/ 스캔 → (face, lm, label) 리스트
+    dataset_keys: 포함할 데이터셋 이름 리스트
     """
-    ds_root = Path(root) / dataset
+    root    = Path(processed_root)
     samples = []
-    detected_suffix = lm_suffix
 
-    for label_str in ("0", "1"):
-        label_dir = ds_root / label_str
-        if not label_dir.exists():
-            log.warning(f"폴더 없음: {label_dir}")
+    for ds_name in dataset_keys:
+        ds_dir = root / ds_name
+        if not ds_dir.exists():
+            log.warning(f"폴더 없음: {ds_dir} — 스킵")
             continue
 
-        label = int(label_str)
-        if detected_suffix is None:
-            detected_suffix = _detect_lm_suffix(label_dir)
+        ds_samples = []
+        for label_str in ("0", "1"):
+            label_dir = ds_dir / label_str
+            if not label_dir.exists():
+                continue
+            label = int(label_str)
 
-        for face_path in sorted(label_dir.glob("*_face.jpg")):
-            stem     = face_path.stem.replace("_face", "")
-            lm_path  = label_dir / f"{stem}{detected_suffix}"
+            # _lm.npy suffix 자동 감지
+            lm_suffix = None
+            for s in ("_lm.npy", "_im.npy"):
+                if next(label_dir.glob(f"*{s}"), None):
+                    lm_suffix = s
+                    break
+            if lm_suffix is None:
+                log.warning(f"랜드마크 파일 없음: {label_dir}")
+                continue
 
-            if lm_path.exists():
-                samples.append((str(face_path), str(lm_path), label))
+            for face_path in sorted(label_dir.glob("*_face.jpg")):
+                stem    = face_path.stem.replace("_face", "")
+                lm_path = label_dir / f"{stem}{lm_suffix}"
+                if lm_path.exists():
+                    ds_samples.append((str(face_path), str(lm_path), label))
 
-    n_real = sum(1 for *_, l in samples if l == 0)
-    n_fake = sum(1 for *_, l in samples if l == 1)
-    log.info(f"전체 수집: real={n_real:,}  fake={n_fake:,}  total={len(samples):,}")
-    return samples, detected_suffix
+        nr = sum(1 for *_, l in ds_samples if l == 0)
+        nf = sum(1 for *_, l in ds_samples if l == 1)
+        log.info(f"[{ds_name}] real={nr:,}  fake={nf:,}  total={len(ds_samples):,}")
+        samples.extend(ds_samples)
+
+    nr = sum(1 for *_, l in samples if l == 0)
+    nf = sum(1 for *_, l in samples if l == 1)
+    log.info(f"전체 수집: real={nr:,}  fake={nf:,}  total={len(samples):,}")
+    return samples
 
 
 def _video_id(face_path: str) -> str:
-    """
-    파일명에서 영상 ID 추출.
-    전처리 코드 기준: {video_stem}_f{idx:03d}_face.jpg
-    → _f000, _f010 ... 제거하면 영상 ID
-    """
     stem = Path(face_path).stem.replace("_face", "")
-    # _f000 ~ _f999 패턴 제거
-    video_id = re.sub(r"_f\d{3}$", "", stem)
-    return video_id
+    return re.sub(r"_f\d{3}$", "", stem)
 
 
 def video_level_split(samples: list, ratio: tuple, seed: int) -> dict:
-    """
-    영상 ID 단위로 train/val/test 분할.
-    같은 영상의 프레임이 서로 다른 split에 들어가지 않도록 보장 (leakage 방지).
-    """
-    # 영상 ID 수집
+    """영상 ID 단위 분할 — data leakage 방지"""
     video_ids = sorted(set(_video_id(fp) for fp, *_ in samples))
     rng = np.random.default_rng(seed)
     rng.shuffle(video_ids)
@@ -157,6 +281,7 @@ def video_level_split(samples: list, ratio: tuple, seed: int) -> dict:
     n  = len(video_ids)
     t1 = int(n * ratio[0])
     t2 = t1 + int(n * ratio[1])
+
     split_map = {}
     for vid in video_ids[:t1]:   split_map[vid] = "train"
     for vid in video_ids[t1:t2]: split_map[vid] = "val"
@@ -164,114 +289,104 @@ def video_level_split(samples: list, ratio: tuple, seed: int) -> dict:
 
     result = {"train": [], "val": [], "test": []}
     for s in samples:
-        vid = _video_id(s[0])
-        result[split_map[vid]].append(s)
+        result[split_map[_video_id(s[0])]].append(s)
 
-    for split, lst in result.items():
+    for sp, lst in result.items():
         nr = sum(1 for *_, l in lst if l == 0)
         nf = sum(1 for *_, l in lst if l == 1)
-        log.info(f"[{split}] real={nr:,}  fake={nf:,}  total={len(lst):,}")
+        log.info(f"[{sp}] real={nr:,}  fake={nf:,}  total={len(lst):,}")
 
     return result
 
 
 def undersample_fake(samples: list, ratio: float, seed: int) -> list:
-    """
-    fake를 real * ratio 개수로 줄임.
-    ratio=3.0 → real 80K, fake 240K → 총 320K
-    """
-    real = [s for s in samples if s[2] == 0]
-    fake = [s for s in samples if s[2] == 1]
+    real   = [s for s in samples if s[2] == 0]
+    fake   = [s for s in samples if s[2] == 1]
     target = int(len(real) * ratio)
 
     if target >= len(fake):
-        log.info("fake 언더샘플 불필요 (target >= 실제 fake 수)")
+        log.info("fake 언더샘플 불필요")
         return samples
 
-    rng = np.random.default_rng(seed)
-    fake_sub = rng.choice(len(fake), size=target, replace=False)
-    fake_sampled = [fake[i] for i in fake_sub]
+    rng          = np.random.default_rng(seed)
+    fake_idx     = rng.choice(len(fake), size=target, replace=False)
+    fake_sampled = [fake[i] for i in fake_idx]
 
-    result = real + fake_sampled
     log.info(
-        f"언더샘플 완료: real={len(real):,}  fake={len(fake_sampled):,}"
-        f"  (원래 {len(fake):,}개에서 {len(fake_sampled):,}개로)"
+        f"언더샘플: real={len(real):,}  fake={len(fake_sampled):,}"
+        f"  (원래 {len(fake):,} → {len(fake_sampled):,})"
     )
-    return result
+    return real + fake_sampled
 
 
 # ═══════════════════════════════════════════════════════════════
-# 2. tf.data 파이프라인
+# 3. tf.data 파이프라인
 # ═══════════════════════════════════════════════════════════════
 
-def _load_npy(path_tensor, shape):
-    arr = np.load(path_tensor.numpy().decode()).astype(np.float32)
-    return arr
+def _load_lm_geom(path_tensor) -> np.ndarray:
+    """
+    .npy (68,2) 로드 → 기하학적 피처 (34,) 추출
+    """
+    lm = np.load(path_tensor.numpy().decode()).astype(np.float32)
+    return extract_geometric_features(lm)
 
 
 def augment_face(face: tf.Tensor) -> tf.Tensor:
-    """train 전용 증강. 입출력: float32 [0,1]"""
     face = tf.image.random_flip_left_right(face)
     face = tf.image.random_brightness(face, max_delta=0.15)
     face = tf.image.random_contrast(face, lower=0.85, upper=1.15)
     face = tf.image.random_saturation(face, lower=0.9, upper=1.1)
-    # JPEG 압축 시뮬레이션 (소셜미디어 업로드 환경 모사)
     face = tf.cast(face * 255, tf.uint8)
-    face = tf.image.encode_jpeg(
-        face, quality=tf.random.uniform([], 70, 100, dtype=tf.int32)
-    )
-    face = tf.cast(tf.image.decode_jpeg(face, channels=3), tf.float32) / 255.0
-    face = tf.clip_by_value(face, 0.0, 1.0)
-    return face
 
-def compute_dct_tf(face_tensor: tf.Tensor) -> tf.Tensor:
-    """
-    face_tensor: (224, 224, 3) float32, ImageNet 정규화 전 [0,1] 값
-    반환: (224, 224, 3) float32 [0, 1] — log-normalized DCT map
-    """
-    # 정규화 전 원본 픽셀 값 필요 → face를 [0,1]로 받아야 함
-    # make_load_fn 에서 DCT는 정규화 전에 계산
-    channels = tf.unstack(face_tensor, axis=-1)  # [R, G, B] 각각 (224,224)
+    def jpeg_compress(img):
+        q = int(np.random.randint(70, 100))
+        encoded = tf.image.encode_jpeg(img, quality=q)
+        return tf.image.decode_jpeg(encoded, channels=3)
+
+    face = tf.py_function(jpeg_compress, [face], tf.uint8)
+    face.set_shape([224, 224, 3])  # py_function 후 shape 명시 필수
+    face = tf.cast(face, tf.float32) / 255.0
+    return tf.clip_by_value(face, 0.0, 1.0)
+
+
+def compute_dct_tf(face: tf.Tensor) -> tf.Tensor:
+    """(224,224,3) [0,1] → DCT log-normalized (224,224,3)"""
+    channels     = tf.unstack(face, axis=-1)
     dct_channels = []
     for ch in channels:
-        # 행 방향 DCT
-        d = tf.signal.dct(ch, type=2, norm="ortho")
-        # 열 방향 DCT (전치 활용)
-        d = tf.signal.dct(tf.transpose(d), type=2, norm="ortho")
-        d = tf.transpose(d)
-        # 로그 스케일 + min-max 정규화
-        d = tf.math.log(tf.abs(d) + 1e-8)
+        d     = tf.signal.dct(ch, type=2, norm="ortho")
+        d     = tf.signal.dct(tf.transpose(d), type=2, norm="ortho")
+        d     = tf.transpose(d)
+        d     = tf.math.log(tf.abs(d) + 1e-8)
         d_min = tf.reduce_min(d)
         d_max = tf.reduce_max(d)
-        d = (d - d_min) / (d_max - d_min + 1e-8)
+        d     = (d - d_min) / (d_max - d_min + 1e-8)
         dct_channels.append(d)
     return tf.stack(dct_channels, axis=-1)
+
 
 def make_load_fn(split: str):
     do_aug = (split == "train")
 
-    def load_fn(face_p, lm_p, label):    # ← dct_p 인자 제거
-        # ── 얼굴 이미지 로드 ([0, 1] 상태 유지)
-        raw  = tf.io.read_file(face_p)
-        face = tf.image.decode_jpeg(raw, channels=3)
+    def load_fn(face_p, lm_p, label):
+        # ── 얼굴 이미지
+        face = tf.image.decode_jpeg(tf.io.read_file(face_p), channels=3)
         face = tf.cast(face, tf.float32) / 255.0
 
         if do_aug:
             face = augment_face(face)
 
-        # ── DCT는 정규화 전 픽셀로 계산 (GPU에서 실시간)
+        # ── DCT (정규화 전 픽셀로 계산)
         dct = compute_dct_tf(face)
         dct.set_shape([224, 224, 3])
 
-        # ── ImageNet 정규화 (DCT 계산 이후에 적용)
+        # ── ImageNet 정규화
         face = (face - MEAN) / STD
         face.set_shape([224, 224, 3])
 
-        # ── 랜드마크
-        lm = tf.py_function(
-            lambda p: (_load_npy(p, [68, 2]) / 224.0), [lm_p], tf.float32
-        )
-        lm.set_shape([68, 2])
+        # ── 랜드마크 → 기하학적 피처 (34,)
+        lm = tf.py_function(_load_lm_geom, [lm_p], tf.float32)
+        lm.set_shape([LM_FEAT_DIM])
 
         return (
             {"face": face, "dct": dct, "lm": lm},
@@ -280,68 +395,60 @@ def make_load_fn(split: str):
 
     return load_fn
 
-def build_tf_dataset(samples, split, batch_size, seed):
+
+def build_tf_dataset(samples: list, split: str,
+                     batch_size: int, seed: int) -> tf.data.Dataset:
     face_paths = [s[0] for s in samples]
     lm_paths   = [s[1] for s in samples]
     labels     = [s[2] for s in samples]
 
-    ds = tf.data.Dataset.from_tensor_slices(
-        (face_paths, lm_paths, labels)
-    )
-
-    load_fn = make_load_fn(split)
-    ds = ds.map(load_fn, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = tf.data.Dataset.from_tensor_slices((face_paths, lm_paths, labels))
+    ds = ds.map(make_load_fn(split), num_parallel_calls=tf.data.AUTOTUNE)
 
     if split == "train":
-        ds = ds.shuffle(buffer_size=4096, seed=seed, reshuffle_each_iteration=True)
+        # buffer 크게 → 도메인 핑거프린트 방지
+        ds = ds.shuffle(buffer_size=10000, seed=seed,
+                        reshuffle_each_iteration=True)
 
-    drop = (split == "train")
-    ds = ds.batch(batch_size, drop_remainder=drop).prefetch(tf.data.AUTOTUNE)
+    ds = ds.batch(
+        batch_size, drop_remainder=(split == "train")
+    ).prefetch(tf.data.AUTOTUNE)
     return ds
 
 
 # ═══════════════════════════════════════════════════════════════
-# 3. 모델 아키텍처
+# 4. 모델 아키텍처
 # ═══════════════════════════════════════════════════════════════
 
-def build_rgb_branch(img_size: int, embed_dim: int, freeze: bool) -> keras.Model:
-    """
-    EfficientNetB4 backbone → GlobalAveragePooling → Dense(embed_dim)
-    freeze=True: backbone 가중치 고정 (feature extractor)
-    """
+def build_rgb_branch(img_size: int, embed_dim: int,
+                     freeze: bool) -> keras.Model:
     base = keras.applications.EfficientNetB4(
-        include_top=False,
-        weights="imagenet",
+        include_top=False, weights="imagenet",
         input_shape=(img_size, img_size, 3),
     )
     base.trainable = not freeze
 
-    inp  = keras.Input(shape=(img_size, img_size, 3), name="face")
-    x    = base(inp, training=False)     # BN은 항상 inference 모드
-    x    = layers.GlobalAveragePooling2D()(x)
-    x    = layers.Dense(embed_dim, use_bias=False)(x)
-    x    = layers.BatchNormalization()(x)
-    x    = layers.Activation("relu")(x)
+    inp = keras.Input(shape=(img_size, img_size, 3), name="face")
+    x   = base(inp, training=False)
+    x   = layers.GlobalAveragePooling2D()(x)
+    x   = layers.Dense(embed_dim, use_bias=False)(x)
+    x   = layers.BatchNormalization()(x)
+    x   = layers.Activation("relu")(x)
     return keras.Model(inp, x, name="rgb_branch")
 
 
 def build_dct_branch(img_size: int, embed_dim: int) -> keras.Model:
-    """
-    DCT 맵 전용 경량 CNN.
-    ImageNet pretrain 없음 — 주파수 도메인은 자연 이미지와 다름.
-    3개 Conv block → GAP → Dense(embed_dim)
-    """
     def conv_block(x, filters, stride=1):
-        x = layers.Conv2D(filters, 3, stride, padding="same", use_bias=False)(x)
+        x = layers.Conv2D(filters, 3, stride, padding="same",
+                          use_bias=False)(x)
         x = layers.BatchNormalization()(x)
-        x = layers.Activation("relu")(x)
-        return x
+        return layers.Activation("relu")(x)
 
     inp = keras.Input(shape=(img_size, img_size, 3), name="dct")
-    x   = conv_block(inp, 32, stride=2)   # → 112
-    x   = conv_block(x,  64, stride=2)   # → 56
-    x   = conv_block(x, 128, stride=2)   # → 28
-    x   = conv_block(x, 256, stride=2)   # → 14
+    x   = conv_block(inp, 32,  stride=2)
+    x   = conv_block(x,   64,  stride=2)
+    x   = conv_block(x,  128,  stride=2)
+    x   = conv_block(x,  256,  stride=2)
     x   = layers.GlobalAveragePooling2D()(x)
     x   = layers.Dense(embed_dim, use_bias=False)(x)
     x   = layers.BatchNormalization()(x)
@@ -349,18 +456,18 @@ def build_dct_branch(img_size: int, embed_dim: int) -> keras.Model:
     return keras.Model(inp, x, name="dct_branch")
 
 
-def build_lm_branch(embed_dim: int, dropout: float) -> keras.Model:
+def build_lm_branch(feat_dim: int, embed_dim: int,
+                    dropout: float) -> keras.Model:
     """
-    랜드마크 68점 (68,2) → Flatten(136) → MLP → Dense(embed_dim)
-    기하학적 비일관성(눈·코·입 비율, 대칭성 위반) 검출
+    입력: (34,) 기하학적 비율 피처
+    출력: (embed_dim,) 임베딩
     """
-    inp = keras.Input(shape=(68, 2), name="lm")
-    x   = layers.Flatten()(inp)                        # (136,)
-    x   = layers.Dense(256, use_bias=False)(x)
+    inp = keras.Input(shape=(feat_dim,), name="lm")
+    x   = layers.Dense(128, use_bias=False)(inp)
     x   = layers.BatchNormalization()(x)
     x   = layers.Activation("relu")(x)
     x   = layers.Dropout(dropout)(x)
-    x   = layers.Dense(128, use_bias=False)(x)
+    x   = layers.Dense(64, use_bias=False)(x)
     x   = layers.BatchNormalization()(x)
     x   = layers.Activation("relu")(x)
     x   = layers.Dropout(dropout * 0.5)(x)
@@ -371,29 +478,22 @@ def build_lm_branch(embed_dim: int, dropout: float) -> keras.Model:
 
 
 def build_model(cfg: dict) -> keras.Model:
-    """
-    3-stream 모델:
-        rgb_embed (256) + dct_embed (128) + lm_embed (64)
-        → Concat (448) → FC (512→256) → sigmoid
-    """
-    img_size = cfg["img_size"]
-
-    rgb_branch = build_rgb_branch(img_size, cfg["rgb_embed_dim"], cfg["freeze_backbone"])
+    img_size   = cfg["img_size"]
+    rgb_branch = build_rgb_branch(img_size, cfg["rgb_embed_dim"],
+                                  cfg["freeze_backbone"])
     dct_branch = build_dct_branch(img_size, cfg["dct_embed_dim"])
-    lm_branch  = build_lm_branch(cfg["lm_embed_dim"], cfg["dropout_rate"])
+    lm_branch  = build_lm_branch(LM_FEAT_DIM, cfg["lm_embed_dim"],
+                                  cfg["dropout_rate"])
 
-    # ── 입력
     inp_face = keras.Input(shape=(img_size, img_size, 3), name="face")
     inp_dct  = keras.Input(shape=(img_size, img_size, 3), name="dct")
-    inp_lm   = keras.Input(shape=(68, 2),                 name="lm")
+    inp_lm   = keras.Input(shape=(LM_FEAT_DIM,),          name="lm")
 
-    # ── 각 스트림 통과
     rgb_feat = rgb_branch(inp_face)
     dct_feat = dct_branch(inp_dct)
     lm_feat  = lm_branch(inp_lm)
 
-    # ── Late Fusion
-    x = layers.Concatenate(name="concat_embeddings")([rgb_feat, dct_feat, lm_feat])
+    x = layers.Concatenate(name="concat")([rgb_feat, dct_feat, lm_feat])
 
     for units in cfg["fusion_hidden"]:
         x = layers.Dense(units, use_bias=False)(x)
@@ -401,48 +501,35 @@ def build_model(cfg: dict) -> keras.Model:
         x = layers.Activation("relu")(x)
         x = layers.Dropout(cfg["dropout_rate"])(x)
 
-    # dtype=float32 강제 (mixed_precision 사용 시 logit은 float32 필요)
     out = layers.Dense(1, name="logit")(x)
     out = layers.Activation("sigmoid", dtype="float32", name="prob")(out)
 
     model = keras.Model(
         inputs={"face": inp_face, "dct": inp_dct, "lm": inp_lm},
         outputs=out,
-        name="deepfake_3stream",
+        name="deepfake_3stream_v2",
     )
     model.summary(line_length=100)
     return model
 
 
 # ═══════════════════════════════════════════════════════════════
-# 4. Focal Loss
+# 5. Focal Loss
 # ═══════════════════════════════════════════════════════════════
 
 class FocalLoss(keras.losses.Loss):
-    """
-    FL(p_t) = -α_t · (1 - p_t)^γ · log(p_t)
-
-    α: real(소수 클래스) 가중치  → fake 가중치 = 1 - α
-    γ: hard example 집중도 (γ=0 → 일반 BCE, γ=2 → 논문 기본값)
-    """
-    def __init__(self, alpha: float = 0.75, gamma: float = 2.0, **kwargs):
+    def __init__(self, alpha=0.75, gamma=2.0, **kwargs):
         super().__init__(**kwargs)
         self.alpha = alpha
         self.gamma = gamma
 
     def call(self, y_true, y_pred):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-
-        # α_t: real(y=0)이면 self.alpha, fake(y=1)이면 1-self.alpha
-        # 주의: real=0 (소수) 에 높은 alpha 부여
+        y_true  = tf.cast(y_true, tf.float32)
+        y_pred  = tf.cast(y_pred, tf.float32)
+        y_pred  = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
         alpha_t = y_true * (1.0 - self.alpha) + (1.0 - y_true) * self.alpha
-
-        # p_t
-        p_t = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
-
-        fl = -alpha_t * tf.pow(1.0 - p_t, self.gamma) * tf.math.log(p_t)
+        p_t     = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
+        fl      = -alpha_t * tf.pow(1.0 - p_t, self.gamma) * tf.math.log(p_t)
         return tf.reduce_mean(fl)
 
     def get_config(self):
@@ -452,26 +539,21 @@ class FocalLoss(keras.losses.Loss):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 5. 스케줄러 — Warmup + Cosine Decay
+# 6. 스케줄러
 # ═══════════════════════════════════════════════════════════════
 
 class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
-    """
-    Linear warmup → Cosine annealing
-    warmup_steps 동안 0 → lr_init 선형 증가
-    이후 lr_init → lr_min 코사인 감소
-    """
     def __init__(self, lr_init, lr_min, warmup_steps, total_steps):
         super().__init__()
         self.lr_init      = float(lr_init)
         self.lr_min       = float(lr_min)
-        self.warmup_steps = float(warmup_steps)
-        self.total_steps  = float(total_steps)
+        self.warmup_steps = int(warmup_steps)
+        self.total_steps  = int(total_steps)
 
     def __call__(self, step):
-        step     = tf.cast(step, tf.float32)
-        warmup   = self.lr_init * (step / self.warmup_steps)
-        cosine   = self.lr_min + 0.5 * (self.lr_init - self.lr_min) * (
+        step   = tf.cast(step, tf.float32)
+        warmup = self.lr_init * (step / self.warmup_steps)
+        cosine = self.lr_min + 0.5 * (self.lr_init - self.lr_min) * (
             1.0 + tf.cos(
                 np.pi * (step - self.warmup_steps) /
                 (self.total_steps - self.warmup_steps)
@@ -489,14 +571,10 @@ class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
 
 
 # ═══════════════════════════════════════════════════════════════
-# 6. Callbacks
+# 7. Callbacks
 # ═══════════════════════════════════════════════════════════════
 
 class BackboneUnfreezeCallback(keras.callbacks.Callback):
-    """
-    unfreeze_epoch에 도달하면 rgb_branch 내 EfficientNet backbone unfreeze.
-    이 시점에 학습률도 1/10으로 낮춤 (fine-tuning용).
-    """
     def __init__(self, unfreeze_epoch: int, lr_scale: float = 0.1):
         super().__init__()
         self.unfreeze_epoch = unfreeze_epoch
@@ -509,41 +587,32 @@ class BackboneUnfreezeCallback(keras.callbacks.Callback):
                 if hasattr(layer, "trainable"):
                     layer.trainable = True
 
-            # ✅ 현재 step에서 스케줄 값 계산
             current_step = self.model.optimizer.iterations
-            current_lr = self.model.optimizer.learning_rate(current_step)
-            new_lr = float(current_lr) * self.lr_scale
-
-            # ✅ 스케줄 → 고정 float으로 교체 (.assign() 아님)
+            current_lr   = self.model.optimizer.learning_rate(current_step)
+            new_lr       = float(current_lr) * self.lr_scale
             self.model.optimizer.learning_rate = new_lr
 
             self._unfrozen = True
-            log.info(
-                f"Epoch {epoch}: backbone unfreeze. "
-                f"lr {float(current_lr):.2e} → {new_lr:.2e}"
-            )
+            log.info(f"Epoch {epoch}: backbone unfreeze. "
+                     f"lr {float(current_lr):.2e} → {new_lr:.2e}")
 
 
-def build_callbacks(cfg: dict, steps_per_epoch: int) -> list:
+def build_callbacks(cfg: dict) -> list:
     os.makedirs(cfg["ckpt_dir"], exist_ok=True)
     os.makedirs(cfg["log_dir"], exist_ok=True)
 
-    ckpt_path = os.path.join(
-        cfg["ckpt_dir"],
-        "best_auc_epoch{epoch:03d}_val{val_auc:.4f}.keras"
-    )
-
-    callbacks = [
-        # ── 최고 val_auc 기준 저장
+    return [
         keras.callbacks.ModelCheckpoint(
-            filepath         = ckpt_path,
-            monitor          = "val_auc",
-            mode             = "max",
-            save_best_only   = True,
-            save_weights_only= False,
-            verbose          = 1,
+            filepath          = os.path.join(
+                cfg["ckpt_dir"],
+                "best_auc_epoch{epoch:03d}_val{val_auc:.4f}.keras"
+            ),
+            monitor           = "val_auc",
+            mode              = "max",
+            save_best_only    = True,
+            save_weights_only = False,
+            verbose           = 1,
         ),
-        # ── 조기 종료 (val_auc 기준, patience=8)
         keras.callbacks.EarlyStopping(
             monitor              = "val_auc",
             mode                 = "max",
@@ -551,48 +620,39 @@ def build_callbacks(cfg: dict, steps_per_epoch: int) -> list:
             restore_best_weights = True,
             verbose              = 1,
         ),
-        # ── TensorBoard
         keras.callbacks.TensorBoard(
-            log_dir          = cfg["log_dir"],
-            histogram_freq   = 0,
-            update_freq      = "epoch",
+            log_dir      = cfg["log_dir"],
+            histogram_freq = 0,
+            update_freq  = "epoch",
         ),
-        # ── CSV 로거
         keras.callbacks.CSVLogger(
             filename = f"training_log_{_ts}.csv",
             append   = False,
         ),
-        # ── Backbone Unfreeze
         BackboneUnfreezeCallback(
             unfreeze_epoch = cfg["unfreeze_epoch"],
             lr_scale       = 0.1,
         ),
-        # ── LR 로깅 (디버깅용)
         keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: log.info(
-                f"Epoch {epoch + 1:3d} │ "
-                f"loss={logs.get('loss', 0):.4f}  "
-                f"auc={logs.get('auc', 0):.4f}  "
-                f"val_loss={logs.get('val_loss', 0):.4f}  "
-                f"val_auc={logs.get('val_auc', 0):.4f}  "
-                f"lr={float(model.optimizer.learning_rate(model.optimizer.iterations)) if callable(model.optimizer.learning_rate) else float(model.optimizer.learning_rate):.2e}"
+                f"Epoch {epoch+1:3d} │ "
+                f"loss={logs.get('loss',0):.4f}  "
+                f"auc={logs.get('auc',0):.4f}  "
+                f"val_loss={logs.get('val_loss',0):.4f}  "
+                f"val_auc={logs.get('val_auc',0):.4f}  "
+                f"lr={ float(model.optimizer.learning_rate(model.optimizer.iterations)) if callable(model.optimizer.learning_rate) else float(model.optimizer.learning_rate) :.2e}"
             )
         ),
     ]
-    return callbacks
 
 
 # ═══════════════════════════════════════════════════════════════
-# 7. 평가 — 상세 지표
+# 8. 평가
 # ═══════════════════════════════════════════════════════════════
 
-def evaluate_model(model: keras.Model, test_ds: tf.data.Dataset):
-    """
-    테스트셋에서 상세 지표 출력:
-    AUC, Accuracy, Precision, Recall, F1, Confusion Matrix
-    """
+def evaluate_model(model: keras.Model, test_ds: tf.data.Dataset,
+                   tag: str = "Test"):
     y_true_all, y_pred_all = [], []
-
     for batch_inputs, batch_labels in test_ds:
         preds = model(batch_inputs, training=False)
         y_pred_all.append(preds.numpy().flatten())
@@ -602,7 +662,6 @@ def evaluate_model(model: keras.Model, test_ds: tf.data.Dataset):
     y_prob = np.concatenate(y_pred_all)
     y_pred = (y_prob >= 0.5).astype(int)
 
-    # sklearn 없이 TF metric으로 계산
     auc_m = keras.metrics.AUC()
     auc_m.update_state(y_true, y_prob)
 
@@ -617,51 +676,30 @@ def evaluate_model(model: keras.Model, test_ds: tf.data.Dataset):
     acc       = (tp + tn) / len(y_true)
 
     log.info("=" * 60)
-    log.info("  테스트셋 평가 결과")
+    log.info(f"  [{tag}] 평가 결과")
     log.info("=" * 60)
     log.info(f"  AUC-ROC   : {auc_m.result().numpy():.4f}")
     log.info(f"  Accuracy  : {acc:.4f}")
-    log.info(f"  Precision : {precision:.4f}  (fake 탐지 정밀도)")
-    log.info(f"  Recall    : {recall:.4f}  (fake 탐지 재현율)")
+    log.info(f"  Precision : {precision:.4f}")
+    log.info(f"  Recall    : {recall:.4f}")
     log.info(f"  F1-Score  : {f1:.4f}")
-    log.info(f"  Confusion Matrix:")
-    log.info(f"            Pred Real  Pred Fake")
-    log.info(f"  True Real  {tn:8,}   {fp:8,}")
-    log.info(f"  True Fake  {fn:8,}   {tp:8,}")
+    log.info(f"  TP={tp:,}  TN={tn:,}  FP={fp:,}  FN={fn:,}")
     log.info("=" * 60)
 
-    return {
-        "auc": auc_m.result().numpy(),
-        "accuracy": acc,
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "confusion_matrix": [[tn, fp], [fn, tp]],
-    }
+    return {"auc": auc_m.result().numpy(), "acc": acc,
+            "precision": precision, "recall": recall, "f1": f1}
 
-
-# ═══════════════════════════════════════════════════════════════
-# 8. 데이터 로더 Sanity Check
-# ═══════════════════════════════════════════════════════════════
 
 def sanity_check(ds: tf.data.Dataset):
-    """배치 1개 뽑아서 shape·dtype·값 범위 확인"""
     log.info("─" * 50)
-    log.info("Sanity check: 배치 1개 로딩 중...")
     for inputs, labels in ds.take(1):
         face = inputs["face"]
         dct  = inputs["dct"]
         lm   = inputs["lm"]
-        log.info(f"  face     shape={face.shape}  dtype={face.dtype}  "
-                 f"min={float(tf.reduce_min(face)):.3f}  max={float(tf.reduce_max(face)):.3f}")
-        log.info(f"  dct      shape={dct.shape}   dtype={dct.dtype}   "
-                 f"min={float(tf.reduce_min(dct)):.3f}  max={float(tf.reduce_max(dct)):.3f}")
-        log.info(f"  lm       shape={lm.shape}    dtype={lm.dtype}    "
-                 f"min={float(tf.reduce_min(lm)):.4f}  max={float(tf.reduce_max(lm)):.4f}")
-        log.info(f"  labels   shape={labels.shape}  values={labels.numpy()}")
-        real_cnt = int(tf.reduce_sum(tf.cast(labels == 0, tf.int32)))
-        fake_cnt = int(tf.reduce_sum(tf.cast(labels == 1, tf.int32)))
-        log.info(f"  배치 내 real={real_cnt}  fake={fake_cnt}")
+        log.info(f"  face  {face.shape}  [{float(tf.reduce_min(face)):.2f}, {float(tf.reduce_max(face)):.2f}]")
+        log.info(f"  dct   {dct.shape}   [{float(tf.reduce_min(dct)):.2f}, {float(tf.reduce_max(dct)):.2f}]")
+        log.info(f"  lm    {lm.shape}    [{float(tf.reduce_min(lm)):.4f}, {float(tf.reduce_max(lm)):.4f}]")
+        log.info(f"  labels {labels.numpy()}")
     log.info("Sanity check 완료")
     log.info("─" * 50)
 
@@ -676,21 +714,21 @@ def main():
     tf.random.set_seed(seed)
     np.random.seed(seed)
 
-    # ── 1. 데이터 수집
+    # ── STEP 1: Train용 데이터 수집 (FF++ + DFF + HIDF)
     log.info("=" * 60)
-    log.info("STEP 1: 데이터 수집")
+    log.info("STEP 1: Train 데이터 수집")
+    log.info(f"  대상: {cfg['train_datasets']}")
     log.info("=" * 60)
-    samples, lm_suffix = collect_samples(
-        cfg["processed_root"], cfg["dataset"], cfg["lm_suffix"]
-    )
+    train_samples = collect_samples(cfg["processed_root"],
+                                    cfg["train_datasets"])
 
-    # ── 2. 영상 ID 단위 분할
+    # ── STEP 2: 영상 ID 단위 분할
     log.info("=" * 60)
     log.info("STEP 2: 영상 ID 단위 분할 (leakage 방지)")
     log.info("=" * 60)
-    splits = video_level_split(samples, cfg["split_ratio"], seed)
+    splits = video_level_split(train_samples, cfg["split_ratio"], seed)
 
-    # ── 3. 불균형 처리 (train만 undersample)
+    # ── STEP 3: 불균형 처리 (train만)
     log.info("=" * 60)
     log.info("STEP 3: 클래스 불균형 처리")
     log.info("=" * 60)
@@ -699,89 +737,92 @@ def main():
             splits["train"], cfg["undersample_ratio"], seed
         )
 
-    # ── 4. tf.data 빌드
+    # ── STEP 4: Test용 데이터 수집 (CelebDF + redface )
     log.info("=" * 60)
-    log.info("STEP 4: tf.data 파이프라인 빌드")
+    log.info("STEP 4: Test 데이터 수집 (학습 미사용)")
+    log.info(f"  대상: {cfg['test_datasets']}")
     log.info("=" * 60)
-    bs = cfg["batch_size"]
-    train_ds = build_tf_dataset(splits["train"], "train", bs, seed)
-    val_ds   = build_tf_dataset(splits["val"],   "val",   bs, seed)
-    test_ds  = build_tf_dataset(splits["test"],  "test",  bs, seed)
+    ext_test_samples = collect_samples(cfg["processed_root"],
+                                       cfg["test_datasets"])
 
-    # Sanity check
+    # ── STEP 5: tf.data 빌드
+    log.info("=" * 60)
+    log.info("STEP 5: tf.data 파이프라인 빌드")
+    log.info("=" * 60)
+    bs       = cfg["batch_size"]
+    train_ds = build_tf_dataset(splits["train"],    "train", bs, seed)
+    val_ds   = build_tf_dataset(splits["val"],      "val",   bs, seed)
+    # 내부 test (train 데이터셋 출신)
+    int_test_ds = build_tf_dataset(splits["test"],  "test",  bs, seed)
+    # 외부 test (CelebDF / redface / Eval-2024)
+    ext_test_ds = build_tf_dataset(ext_test_samples,"test",  bs, seed)
+
     sanity_check(train_ds)
 
-    # ── 5. 모델 빌드
+    # ── STEP 6: 모델 빌드
     log.info("=" * 60)
-    log.info("STEP 5: 모델 빌드")
+    log.info("STEP 6: 모델 빌드")
     log.info("=" * 60)
     global model
     model = build_model(cfg)
 
-    # ── 6. 옵티마이저 & 컴파일
+    # ── STEP 7: 컴파일
     log.info("=" * 60)
-    log.info("STEP 6: 컴파일")
+    log.info("STEP 7: 컴파일")
     log.info("=" * 60)
     steps_per_epoch = len(splits["train"]) // bs
     total_steps     = steps_per_epoch * cfg["epochs"]
     warmup_steps    = steps_per_epoch * cfg["warmup_epochs"]
 
-    schedule = WarmupCosineDecay(
-        lr_init      = cfg["lr_init"],
-        lr_min       = cfg["lr_min"],
-        warmup_steps = warmup_steps,
-        total_steps  = total_steps,
+    schedule  = WarmupCosineDecay(cfg["lr_init"], cfg["lr_min"],
+                                   int(warmup_steps), int(total_steps))
+    optimizer = tfa.optimizers.AdamW(
+        learning_rate=schedule,
+        weight_decay=cfg["weight_decay"],
     )
-    optimizer = keras.optimizers.AdamW(
-        learning_rate  = schedule,
-        weight_decay   = cfg["weight_decay"],
-    )
-
     model.compile(
         optimizer = optimizer,
-        loss      = FocalLoss(alpha=cfg["focal_alpha"], gamma=cfg["focal_gamma"]),
+        loss      = FocalLoss(cfg["focal_alpha"], cfg["focal_gamma"]),
         metrics   = [
             keras.metrics.AUC(name="auc"),
-            keras.metrics.BinaryAccuracy(name="acc", threshold=0.5),
-            keras.metrics.Precision(name="precision", thresholds=0.5),
-            keras.metrics.Recall(name="recall", thresholds=0.5),
+            keras.metrics.BinaryAccuracy(name="acc"),
+            keras.metrics.Precision(name="precision"),
+            keras.metrics.Recall(name="recall"),
         ],
     )
+    log.info(f"steps_per_epoch={steps_per_epoch:,}  "
+             f"total_steps={total_steps:,}  warmup={warmup_steps:,}")
 
-    log.info(f"steps_per_epoch = {steps_per_epoch:,}")
-    log.info(f"total_steps     = {total_steps:,}")
-    log.info(f"warmup_steps    = {warmup_steps:,}")
-
-    # ── 7. 학습
+    # ── STEP 8: 학습
     log.info("=" * 60)
-    log.info("STEP 7: 학습 시작")
+    log.info("STEP 8: 학습 시작")
     log.info("=" * 60)
-    t0 = time.time()
-
+    t0      = time.time()
     history = model.fit(
         train_ds,
         validation_data = val_ds,
         epochs          = cfg["epochs"],
-        callbacks       = build_callbacks(cfg, steps_per_epoch),
+        callbacks       = build_callbacks(cfg),
         verbose         = 1,
     )
+    log.info(f"학습 완료 — {(time.time()-t0)/3600:.1f}h")
 
-    elapsed = time.time() - t0
-    log.info(f"학습 완료 — {elapsed/3600:.1f}h ({elapsed:.0f}s)")
-
-    # ── 8. 테스트 평가
+    # ── STEP 9: 평가 (내부 + 외부)
     log.info("=" * 60)
-    log.info("STEP 8: 테스트셋 최종 평가")
+    log.info("STEP 9: 최종 평가")
     log.info("=" * 60)
-    results = evaluate_model(model, test_ds)
+    int_results = evaluate_model(model, int_test_ds,
+                                 tag="Internal Test (FF++/DFF/HIDF)")
+    ext_results = evaluate_model(model, ext_test_ds,
+                                 tag="External Test (CelebDF/redface/Eval-2024)")
 
-    # ── 9. 최종 모델 저장
+    # ── STEP 10: 저장
     final_path = os.path.join(cfg["ckpt_dir"], f"final_model_{_ts}.keras")
     model.save(final_path)
     log.info(f"최종 모델 저장: {final_path}")
 
-    return history, results
+    return history, int_results, ext_results
 
 
 if __name__ == "__main__":
-    history, results = main()
+    history, int_res, ext_res = main()

@@ -66,7 +66,7 @@ CFG = {
 
 DATASETS = {
     "dff"    : ("./data/dff",     "parse_dff"),
-    "ffpp"   : ("./data/ff++",    "parse_ffpp"),
+    "ffpp"   : ("./data/ffpp",    "parse_ffpp"),
     "celebdf": ("./data/celebdf", "parse_celebdf"),
     "hidf": ("./data/hidf", "parse_hidf"),
     "redface": ("./data/redface", "parse_redface"),
@@ -127,19 +127,19 @@ def parse_ffpp(root: str):
     samples, root = [], Path(root)
 
     for method in ["youtube","actors"]:
-        for p in (root / f"original_sequences/{method}/c40/videos").glob("*.mp4"):
+        for p in (root / f"original_sequences/{method}/c23/videos").glob("*.mp4"):
             samples.append((str(p), 0))
 
     for method in ["Deepfakes", "Face2Face", "FaceSwap", "NeuralTextures"]:
-        for p in (root / f"manipulated_sequences/{method}/c40/videos").glob("*.mp4"):
+        for p in (root / f"manipulated_sequences/{method}/c23/videos").glob("*.mp4"):
             samples.append((str(p), 1))
-    log.info(f"[FF++] {len(samples)} samples")
+    log.info(f"[ffpp] {len(samples)} samples")
 
     return samples
 
 def parse_redface(root: str):
     """
-    RedFace 구조:
+    redface 구조:
       root/
         Original/   → real (label 0)
         EFS/        → Entire Face Synthesis  (label 1)
@@ -151,16 +151,16 @@ def parse_redface(root: str):
 
     # 진짜
     for ext in ["*.jpg", "*.jpeg", "*.png", "*.mp4"]:
-        for p in (root / "Original").rglob(ext):
+        for p in (root / "Original").glob(ext):
             samples.append((str(p), 0))
 
     # 가짜 4종
     for fake_dir in ["EFS", "FAM", "FR", "FS"]:
         for ext in ["*.jpg", "*.jpeg", "*.png", "*.mp4"]:
-            for p in (root / fake_dir).rglob(ext):
+            for p in (root / fake_dir).glob(ext):
                 samples.append((str(p), 1))
 
-    log.info(f"[RedFace] {len(samples)} samples  "
+    log.info(f"[redface] {len(samples)} samples  "
              f"(real={sum(1 for _,l in samples if l==0)}, "
              f"fake={sum(1 for _,l in samples if l==1)})")
     return samples
@@ -213,7 +213,7 @@ PARSERS = {
     "parse_ffpp"   : parse_ffpp,
     "parse_celebdf": parse_celebdf,
     "parse_hidf" : parse_hidf,
-    "parse_redFace" : parse_redface
+    "parse_redface" : parse_redface,
 }
 
 
@@ -654,7 +654,7 @@ if __name__ == "__main__":
         )
 
     # ── 전처리 실행 ──────────────────────────────────────────────────────────
-    processed_root = run_pipeline(dataset_keys=["celebdf","ffpp","hidf","redface","dff"])
+    processed_root = run_pipeline(dataset_keys=["ffpp"])
 
     # ── tf.data 검증 ─────────────────────────────────────────────────────────
     if not any(Path(processed_root).rglob("*_face.jpg")):
