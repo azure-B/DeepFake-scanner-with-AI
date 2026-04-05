@@ -454,8 +454,8 @@ def build_tf_dataset(samples: list, split: str,
     ds = ds.batch(batch_size, drop_remainder=(split == "train"))
 
     # ← MixUp은 반드시 batch() 이후에 (배치 단위 연산이기 때문)
-    # if split == "train":
-    #     ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    if split == "train":
+        ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
 
     return ds.prefetch(tf.data.AUTOTUNE)
 
@@ -858,8 +858,8 @@ def main():
     )
     model.compile(
         optimizer = optimizer,
-        # loss      = FocalLoss(cfg["focal_alpha"], cfg["focal_gamma"]),
-        loss=tf.keras.losses.BinaryCrossentropy(),
+        loss      = FocalLoss(cfg["focal_alpha"], cfg["focal_gamma"]),
+        # loss=tf.keras.losses.BinaryCrossentropy(),
         metrics   = [
             keras.metrics.AUC(name="auc"),
             keras.metrics.BinaryAccuracy(name="acc"),

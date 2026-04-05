@@ -1,4 +1,6 @@
 /data
 /.venv
 /processed
+/checkpoints
+*.log
 /face_detection_yunet_2023mar.onnx
