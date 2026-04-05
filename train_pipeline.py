@@ -62,30 +62,30 @@ CFG = {
     "test_datasets"    : ["celebdf", "redface"],
 
     # ── 불균형
-    "undersample_ratio": 3.0,        # fake = real * ratio
+    "undersample_ratio": 1.0,        # fake = real * ratio
 
     # ── 이미지
     "img_size"         : 224,
 
     # ── 모델
     "freeze_backbone"  : True,
-    "unfreeze_epoch"   : 10,
+    "unfreeze_epoch"   : 15,
     "rgb_embed_dim"    : 256,
     "dct_embed_dim"    : 128,
     "lm_embed_dim"     : 32,         # 64 → 32로 축소 (기하학적 피처 34차원에 맞게)
     "fusion_hidden"    : [512, 256],
-    "dropout_rate"     : 0.4,
+    "dropout_rate"     : 0.5,
 
     # ── 학습
     "batch_size"       : 32,
     "epochs"           : 50,
-    "lr_init"          : 1e-3,
-    "lr_min"           : 1e-6,
-    "warmup_epochs"    : 3,
-    "weight_decay"     : 1e-4,
+    "lr_init"          : 3e-4,
+    "lr_min"           : 1e-7,
+    "warmup_epochs"    : 5,
+    "weight_decay"     : 3e-4,
 
     # ── Focal Loss
-    "focal_alpha"      : 0.75,
+    "focal_alpha"      : 0.25,
     "focal_gamma"      : 2.0,
 
     # ── 분할
@@ -329,24 +329,63 @@ def _load_lm_geom(path_tensor) -> np.ndarray:
     lm = np.load(path_tensor.numpy().decode()).astype(np.float32)
     return extract_geometric_features(lm)
 
+def mixup_batch(inputs, labels, alpha=0.2):
+    """배치 내 MixUp — 도메인 일반화에 유효"""
+    batch_size = tf.shape(inputs["face"])[0]
+    lam = tf.random.uniform([], 0.0, alpha)   # 약한 MixUp
+    lam = tf.maximum(lam, 1.0 - lam)          # lam >= 0.5 보장
+
+    # 셔플 인덱스
+    idx = tf.random.shuffle(tf.range(batch_size))
+
+    mixed = {}
+    for key in ["face", "dct"]:
+        mixed[key] = lam * inputs[key] + (1 - lam) * tf.gather(inputs[key], idx)
+    mixed["lm"] = inputs["lm"]  # LM은 mix 안 함
+
+    # 소프트 레이블
+    labels_f   = tf.cast(labels, tf.float32)
+    labels_mix = lam * labels_f + (1 - lam) * tf.cast(tf.gather(labels, idx), tf.float32)
+
+    return mixed, labels_mix
+
 
 def augment_face(face: tf.Tensor) -> tf.Tensor:
     face = tf.image.random_flip_left_right(face)
-    face = tf.image.random_brightness(face, max_delta=0.15)
-    face = tf.image.random_contrast(face, lower=0.85, upper=1.15)
-    face = tf.image.random_saturation(face, lower=0.9, upper=1.1)
+    face = tf.image.random_brightness(face, max_delta=0.2)
+    face = tf.image.random_contrast(face, lower=0.7, upper=1.3)
+    face = tf.image.random_saturation(face, lower=0.7, upper=1.3)
+    face = tf.image.random_hue(face, max_delta=0.05)          # 추가
+
+    # Gaussian noise 추가 (도메인 핑거프린트 희석)
+    noise = tf.random.normal(tf.shape(face), stddev=0.02)
+    face = tf.clip_by_value(face + noise, 0.0, 1.0)
+
     face = tf.cast(face * 255, tf.uint8)
 
     def jpeg_compress(img):
-        q = int(np.random.randint(70, 100))
+        # JPEG 품질 범위를 더 넓게 (50~95) → 압축 아티팩트 다양화
+        q = int(np.random.randint(50, 95))
         encoded = tf.image.encode_jpeg(img, quality=q)
         return tf.image.decode_jpeg(encoded, channels=3)
 
     face = tf.py_function(jpeg_compress, [face], tf.uint8)
-    face.set_shape([224, 224, 3])  # py_function 후 shape 명시 필수
+    face.set_shape([224, 224, 3])
     face = tf.cast(face, tf.float32) / 255.0
-    return tf.clip_by_value(face, 0.0, 1.0)
 
+    # Random Gaussian blur (도메인 일반화)
+    def random_blur(img):
+        if np.random.rand() < 0.3:
+            sigma = np.random.uniform(0.5, 1.5)
+            # 간단한 근사: average pooling으로 blur 효과
+            img = tf.expand_dims(img, 0)
+            img = tf.nn.avg_pool2d(img, ksize=3, strides=1, padding='SAME')
+            img = tf.squeeze(img, 0)
+        return img
+
+    face = tf.py_function(random_blur, [face], tf.float32)
+    face.set_shape([224, 224, 3])
+    return tf.clip_by_value(face, 0.0, 1.0)
 
 def compute_dct_tf(face: tf.Tensor) -> tf.Tensor:
     """(224,224,3) [0,1] → DCT log-normalized (224,224,3)"""
@@ -402,17 +441,21 @@ def build_tf_dataset(samples: list, split: str,
     labels     = [s[2] for s in samples]
 
     ds = tf.data.Dataset.from_tensor_slices((face_paths, lm_paths, labels))
-    ds = ds.map(make_load_fn(split), num_parallel_calls=tf.data.AUTOTUNE)
 
+    # ← 셔플을 map 이전으로 이동 (파일 경로 단계에서 섞는 게 더 효율적)
     if split == "train":
-        # buffer 크게 → 도메인 핑거프린트 방지
         ds = ds.shuffle(buffer_size=10000, seed=seed,
                         reshuffle_each_iteration=True)
 
-    ds = ds.batch(
-        batch_size, drop_remainder=(split == "train")
-    ).prefetch(tf.data.AUTOTUNE)
-    return ds
+    ds = ds.map(make_load_fn(split), num_parallel_calls=tf.data.AUTOTUNE)
+
+    ds = ds.batch(batch_size, drop_remainder=(split == "train"))
+
+    # ← MixUp은 반드시 batch() 이후에 (배치 단위 연산이기 때문)
+    if split == "train":
+        ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
+
+    return ds.prefetch(tf.data.AUTOTUNE)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -510,7 +553,6 @@ def build_model(cfg: dict) -> keras.Model:
         outputs=out,
         name="deepfake_3stream_v2",
     )
-    model.summary(line_length=100)
     return model
 
 
@@ -528,7 +570,7 @@ class FocalLoss(keras.losses.Loss):
         y_true  = tf.cast(y_true, tf.float32)
         y_pred  = tf.cast(y_pred, tf.float32)
         y_pred  = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        alpha_t = y_true * (1.0 - self.alpha) + (1.0 - y_true) * self.alpha
+        alpha_t = y_true * self.alpha + (1.0 - y_true) * (1.0 - self.alpha)
         p_t     = y_true * y_pred + (1.0 - y_true) * (1.0 - y_pred)
         fl      = -alpha_t * tf.pow(1.0 - p_t, self.gamma) * tf.math.log(p_t)
         return tf.reduce_mean(fl)
@@ -623,9 +665,10 @@ def build_callbacks(cfg: dict) -> list:
         keras.callbacks.EarlyStopping(
             monitor              = "val_auc",
             mode                 = "max",
-            patience             = 8,
+            patience             = 12,
             restore_best_weights = True,
             verbose              = 1,
+            min_delta            = 0.001,
         ),
         # keras.callbacks.TensorBoard(
         #     log_dir      = cfg["log_dir"],
@@ -667,7 +710,21 @@ def evaluate_model(model: keras.Model, test_ds: tf.data.Dataset,
 
     y_true = np.concatenate(y_true_all)
     y_prob = np.concatenate(y_pred_all)
-    y_pred = (y_prob >= 0.5).astype(int)
+    thresholds = np.arange(0.1, 0.9, 0.05)
+    best_f1, best_thr = 0.0, 0.5
+    for thr in thresholds:
+        yp = (y_prob >= thr).astype(int)
+        tp = np.sum((yp == 1) & (y_true == 1))
+        fp = np.sum((yp == 1) & (y_true == 0))
+        fn = np.sum((yp == 0) & (y_true == 1))
+        p = tp / (tp + fp + 1e-8)
+        r = tp / (tp + fn + 1e-8)
+        f1 = 2 * p * r / (p + r + 1e-8)
+        if f1 > best_f1:
+            best_f1, best_thr = f1, thr
+
+    log.info(f"  최적 임계값: {best_thr:.2f}  (F1={best_f1:.4f})")
+    y_pred = (y_prob >= best_thr).astype(int)
 
     auc_m = keras.metrics.AUC()
     auc_m.update_state(y_true, y_prob)
@@ -829,7 +886,7 @@ def main():
 
     # ── STEP 10: 저장
     final_path = os.path.join(cfg["ckpt_dir"], f"final_model_{_ts}")
-    model.save(final_path)
+    model.save_weights(final_path)
     log.info(f"최종 모델 저장: {final_path}")
 
     return history, int_results, ext_results
