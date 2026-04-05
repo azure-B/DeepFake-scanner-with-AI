@@ -85,7 +85,7 @@ CFG = {
     "weight_decay"     : 3e-4,
 
     # ── Focal Loss
-    "focal_alpha"      : 0.25,
+    "focal_alpha"      : 0.5,
     "focal_gamma"      : 2.0,
 
     # ── 분할
@@ -315,7 +315,10 @@ def undersample_fake(samples: list, ratio: float, seed: int) -> list:
         f"언더샘플: real={len(real):,}  fake={len(fake_sampled):,}"
         f"  (원래 {len(fake):,} → {len(fake_sampled):,})"
     )
-    return real + fake_sampled
+    combined = real + fake_sampled
+    rng.shuffle(combined)
+
+    return combined
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -355,17 +358,17 @@ def augment_face(face: tf.Tensor) -> tf.Tensor:
     face = tf.image.random_brightness(face, max_delta=0.2)
     face = tf.image.random_contrast(face, lower=0.7, upper=1.3)
     face = tf.image.random_saturation(face, lower=0.7, upper=1.3)
-    face = tf.image.random_hue(face, max_delta=0.05)          # 추가
+    # face = tf.image.random_hue(face, max_delta=0.05)          # 추가
 
     # Gaussian noise 추가 (도메인 핑거프린트 희석)
-    noise = tf.random.normal(tf.shape(face), stddev=0.02)
-    face = tf.clip_by_value(face + noise, 0.0, 1.0)
+    # noise = tf.random.normal(tf.shape(face), stddev=0.02)
+    # face = tf.clip_by_value(face + noise, 0.0, 1.0)
 
     face = tf.cast(face * 255, tf.uint8)
 
     def jpeg_compress(img):
         # JPEG 품질 범위를 더 넓게 (50~95) → 압축 아티팩트 다양화
-        q = int(np.random.randint(50, 95))
+        q = int(np.random.randint(75, 95))
         encoded = tf.image.encode_jpeg(img, quality=q)
         return tf.image.decode_jpeg(encoded, channels=3)
 
@@ -377,7 +380,6 @@ def augment_face(face: tf.Tensor) -> tf.Tensor:
     def random_blur(img):
         if np.random.rand() < 0.3:
             sigma = np.random.uniform(0.5, 1.5)
-            # 간단한 근사: average pooling으로 blur 효과
             img = tf.expand_dims(img, 0)
             img = tf.nn.avg_pool2d(img, ksize=3, strides=1, padding='SAME')
             img = tf.squeeze(img, 0)
@@ -452,8 +454,8 @@ def build_tf_dataset(samples: list, split: str,
     ds = ds.batch(batch_size, drop_remainder=(split == "train"))
 
     # ← MixUp은 반드시 batch() 이후에 (배치 단위 연산이기 때문)
-    if split == "train":
-        ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
+    # if split == "train":
+    #     ds = ds.map(mixup_batch, num_parallel_calls=tf.data.AUTOTUNE)
 
     return ds.prefetch(tf.data.AUTOTUNE)
 
@@ -823,6 +825,12 @@ def main():
     ext_test_ds = build_tf_dataset(ext_test_samples,"test",  bs, seed)
 
     # sanity_check(train_ds)
+    def sanity_check(ds, model, tag=""):
+        for inputs, labels in ds.take(1):
+            preds = model(inputs, training=False)
+            log.info(
+                f"[{tag}] pred min={float(tf.reduce_min(preds)):.3f} max={float(tf.reduce_max(preds)):.3f} mean={float(tf.reduce_mean(preds)):.3f}")
+            log.info(f"[{tag}] labels {labels.numpy()[:8]}")
 
     # ── STEP 6: 모델 빌드
     log.info("=" * 60)
@@ -830,6 +838,9 @@ def main():
     log.info("=" * 60)
     global model
     model = build_model(cfg)
+
+    sanity_check(train_ds, model, "train")
+    sanity_check(val_ds, model, "val")
 
     # ── STEP 7: 컴파일
     log.info("=" * 60)
@@ -847,7 +858,8 @@ def main():
     )
     model.compile(
         optimizer = optimizer,
-        loss      = FocalLoss(cfg["focal_alpha"], cfg["focal_gamma"]),
+        # loss      = FocalLoss(cfg["focal_alpha"], cfg["focal_gamma"]),
+        loss=tf.keras.losses.BinaryCrossentropy(),
         metrics   = [
             keras.metrics.AUC(name="auc"),
             keras.metrics.BinaryAccuracy(name="acc"),
@@ -871,6 +883,7 @@ def main():
         validation_data = val_ds,
         epochs          = cfg["epochs"],
         callbacks       = build_callbacks(cfg),
+        class_weight={0: 1.0, 1: 1.0},
         verbose         = 1,
     )
     log.info(f"학습 완료 — {(time.time()-t0)/3600:.1f}h")
