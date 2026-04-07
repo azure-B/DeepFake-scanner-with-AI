@@ -20,22 +20,27 @@ Architecture:
 """
 
 import os, sys, re, time, logging
+import glob
 from pathlib import Path
 from datetime import datetime
 
 import numpy as np
+import pywt
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers, mixed_precision
 
 # ── 로깅 ────────────────────────────────────────────────────────
+os.makedirs("log", exist_ok=True)
+
 _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(f"train_{_ts}.log", encoding="utf-8"),
+        logging.FileHandler(f"log/train_{_ts}.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
@@ -61,16 +66,12 @@ log.info(f"compute dtype: {mixed_precision.global_policy().compute_dtype}")
 
 # DCT 저주파 마스크 전역 상수 (매 샘플마다 생성 방지)
 def _create_dct_mask():
-    mask = np.zeros((224, 224), dtype=np.float32)
-    for i in range(224):
-        for j in range(224):
-            if i + j < 224:
-                mask[i, j] = 1.0
-    return mask
+    i = np.arange(224).reshape(224, 1)
+    j = np.arange(224).reshape(1, 224)
+    return (i + j < 224).astype(np.float32)
 
-# 지연 초기화를 버리고, 코드 실행 즉시 전역 상수로 쾅 박아버립니다.
-_DCT_LOW_MASK = tf.constant(_create_dct_mask())
-
+N_BANDS    = 10
+BAND_NAMES = ["LL3","LH3","HL3","HH3","LH2","HL2","HH2","LH1","HL1","HH1"]
 
 # ═══════════════════════════════════════════════════════════════
 # 0. CONFIG
@@ -87,13 +88,16 @@ CFG = {
 
     # ── 모델
     "freeze_backbone"  : True,
-    "unfreeze_epoch"   : 15,
+    "unfreeze_epoch"   : 8,
     "rgb_embed_dim"    : 256,
+    "wav_embed_dim": 256,  # ← 추가
     "dct_embed_dim"    : 128,
     "lm_embed_dim"     : 32,
     "attn_dim"         : 128,       # Cross-Attention 공통 차원
     "head_hidden"      : 64,        # 각 Head Dense 크기
     "dropout_rate"     : 0.4,
+    "wav_num_heads": 8,  # ← 추가
+    "wav_num_layers": 4,
 
     # ── 학습
     "batch_size"       : 16,        # CLIP ViT 메모리 때문에 16
@@ -120,7 +124,7 @@ CFG = {
 MEAN = tf.constant([0.48145466, 0.4578275,  0.40821073], dtype=tf.float32)
 STD  = tf.constant([0.26862954, 0.26130258, 0.27577711], dtype=tf.float32)
 
-LM_FEAT_DIM = 34
+LM_FEAT_DIM = 68
 HEAD_NAMES  = ["rgb", "dct", "lm", "rgb_dct", "rgb_lm", "dct_lm", "all"]
 AUX_HEAD_NAMES = ["aux_lf", "aux_hf"]
 
@@ -203,6 +207,44 @@ def extract_geometric_features(lm: np.ndarray) -> np.ndarray:
 
     return np.array(feats[:LM_FEAT_DIM], dtype=np.float32)
 
+def extract_geometric_features_v2(lm: np.ndarray) -> np.ndarray:
+    """
+    기존 34차원 → 68차원으로 확장
+    절대 좌표 기반 미세 변형 감지 추가
+    """
+    # 기존 34차원 비율 피처
+    ratio_feats = extract_geometric_features(lm)  # (34,)
+
+    # ── 추가 1: 인접 랜드마크 간 거리 변화 (국소 변형) ──────────
+    # deepfake는 특정 부위(눈, 입 주변)에서 미세한 비연속성 발생
+    local_dists = []
+    # 눈 주변 6점 간 거리
+    for i in range(36, 41):
+        local_dists.append(float(np.linalg.norm(lm[i] - lm[i+1])))
+    for i in range(42, 47):
+        local_dists.append(float(np.linalg.norm(lm[i] - lm[i+1])))
+    # 입 주변 12점 간 거리
+    for i in range(48, 59):
+        local_dists.append(float(np.linalg.norm(lm[i] - lm[i+1])))
+
+    # 정규화
+    face_w = float(np.linalg.norm(lm[16] - lm[0])) + 1e-8
+    local_dists = np.array(local_dists, dtype=np.float32) / face_w
+
+    # ── 추가 2: 랜드마크 곡률 (부드러움 정도) ────────────────────
+    # deepfake는 랜드마크 경계가 부자연스럽게 꺾임
+    curvatures = []
+    for i in range(1, 18):  # 턱선
+        v1 = lm[i]   - lm[i-1]
+        v2 = lm[i+1] - lm[i]
+        cos_sim = np.dot(v1, v2) / (
+            np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-8
+        )
+        curvatures.append(float(cos_sim))
+    curvatures = np.array(curvatures, dtype=np.float32)
+
+    feats = np.concatenate([ratio_feats, local_dists[:17], curvatures[:17]])
+    return feats[:68].astype(np.float32)  # 68차원
 
 # ═══════════════════════════════════════════════════════════════
 # 2. 데이터 수집 & 분할
@@ -300,39 +342,62 @@ def _load_lm_geom(path_tensor, flipped=False) -> np.ndarray:
         img_w    = lm[:, 0].max() + lm[:, 0].min()
         lm       = lm.copy()
         lm[:, 0] = img_w - lm[:, 0]
-    return extract_geometric_features(lm)
+    return extract_geometric_features_v2(lm)
 
 
-def compute_dct_tf(face: tf.Tensor) -> tf.Tensor:
-    channels = tf.unstack(face, axis=-1)
-    low_chs, high_chs = [], []
-    mask = _DCT_LOW_MASK  # ← 전역 상수 재사용
-    for ch in channels:
-        d     = tf.signal.dct(ch, type=2, norm="ortho")
-        d     = tf.signal.dct(tf.transpose(d), type=2, norm="ortho")
-        d     = tf.transpose(d)
-        d     = tf.math.log(tf.abs(d) + 1e-8)
-        d_min = tf.reduce_min(d)
-        d_max = tf.reduce_max(d)
-        d     = (d - d_min) / (d_max - d_min + 1e-8)
-        low   = d * mask
-        high  = d - low
-        low_chs.append(low)
-        high_chs.append(high)
-    return tf.concat([
-        tf.stack(low_chs,  axis=-1),
-        tf.stack(high_chs, axis=-1),
-    ], axis=-1)
+# ── 기존 compute_dct_tf 삭제 후 아래로 교체 ──────────────────────
+
+def _decompose_wavelet_np(img_np: np.ndarray) -> np.ndarray:
+    """
+    (224, 224, 3) float32 [0,1] → (10, 14, 14, 3) float32
+
+    3단계 Haar 분해 → 각 서브밴드를 14×14로 리사이즈.
+    14×14: CLIP ViT-B/16 내부 패치 그리드와 동일 해상도.
+    공간-주파수 지역성 동시 보존 (DCT는 전역 변환이라 위치 정보 소실).
+    """
+    result = []
+    for band_idx in range(N_BANDS):
+        ch_list = []
+        for c in range(3):
+            ch = img_np[:, :, c]
+            LL,  (LH1, HL1, HH1) = pywt.dwt2(ch,  "haar")
+            LL2, (LH2, HL2, HH2) = pywt.dwt2(LL,  "haar")
+            LL3, (LH3, HL3, HH3) = pywt.dwt2(LL2, "haar")
+            bands = [LL3, LH3, HL3, HH3, LH2, HL2, HH2, LH1, HL1, HH1]
+
+            b = bands[band_idx].astype(np.float32)
+            # 14×14 리사이즈
+            b_t = tf.image.resize(
+                b[..., np.newaxis], [14, 14], method="bilinear"
+            )
+            b_norm = tf.squeeze(b_t, -1).numpy()
+            # 서브밴드별 정규화 (스케일이 제각각이므로)
+            b_min, b_max = b_norm.min(), b_norm.max()
+            b_norm = (b_norm - b_min) / (b_max - b_min + 1e-8)
+            ch_list.append(b_norm)
+
+        result.append(np.stack(ch_list, axis=-1))   # (14, 14, 3)
+
+    return np.stack(result, axis=0)                  # (10, 14, 14, 3)
+
+
+def _load_wavelet(img_path_tensor, flip: bool = False) -> np.ndarray:
+    """tf.py_function 래퍼 — 이미지 경로 → 웨이블릿 서브밴드"""
+    path = img_path_tensor.numpy().decode()
+    img  = tf.image.decode_jpeg(tf.io.read_file(path), channels=3)
+    img  = tf.cast(img, tf.float32) / 255.0
+    if flip:
+        img = tf.image.flip_left_right(img)
+    return _decompose_wavelet_np(img.numpy())
 
 def augment_face_no_flip(face: tf.Tensor) -> tf.Tensor:
-    """flip을 제외한 증강 — flip은 LM과 동기화하여 make_load_fn에서 처리"""
     face = tf.image.random_brightness(face, max_delta=0.2)
     face = tf.image.random_contrast(face, lower=0.7, upper=1.3)
     face = tf.image.random_saturation(face, lower=0.7, upper=1.3)
     face = tf.cast(face * 255, tf.uint8)
 
     def jpeg_compress(img):
-        q       = int(np.random.randint(75, 95))
+        q       = int(np.random.randint(50, 95))  # 75→50으로 하한 낮춤
         encoded = tf.image.encode_jpeg(img, quality=q)
         return tf.image.decode_jpeg(encoded, channels=3)
 
@@ -340,17 +405,36 @@ def augment_face_no_flip(face: tf.Tensor) -> tf.Tensor:
     face.set_shape([224, 224, 3])
     face = tf.cast(face, tf.float32) / 255.0
 
-    def random_blur(img):
-        if np.random.rand() < 0.3:
-            img = tf.expand_dims(img, 0)
-            img = tf.nn.avg_pool2d(img, ksize=3, strides=1, padding="SAME")
-            img = tf.squeeze(img, 0)
-        return img
-
-    face = tf.py_function(random_blur, [face], tf.float32)
+    # 블러
+    do_blur = tf.random.uniform([]) < 0.3
+    blurred = tf.squeeze(
+        tf.nn.avg_pool2d(tf.expand_dims(face, 0), ksize=3, strides=1, padding="SAME"), 0
+    )
+    face = tf.cond(do_blur, lambda: blurred, lambda: face)
     face.set_shape([224, 224, 3])
-    return tf.clip_by_value(face, 0.0, 1.0)
 
+    # ── 추가: 다운샘플 → 업샘플 (압축 아티팩트 시뮬레이션) ──
+    do_resize = tf.random.uniform([]) < 0.4
+    small  = tf.image.resize(face, [112, 112])
+    small  = tf.image.resize(small, [224, 224])
+    face   = tf.cond(do_resize, lambda: small, lambda: face)
+    face.set_shape([224, 224, 3])
+
+    # ── 추가: 가우시안 노이즈 ──
+    do_noise = tf.random.uniform([]) < 0.3
+    noise  = tf.random.normal([224, 224, 3], mean=0.0, stddev=0.03)
+    noisy  = tf.clip_by_value(face + noise, 0.0, 1.0)
+    face   = tf.cond(do_noise, lambda: noisy, lambda: face)
+    face.set_shape([224, 224, 3])
+
+    # ── 추가: 랜덤 그레이스케일 (색상 의존성 감소) ──
+    do_gray = tf.random.uniform([]) < 0.1
+    gray   = tf.image.rgb_to_grayscale(face)
+    gray   = tf.repeat(gray, 3, axis=-1)
+    face   = tf.cond(do_gray, lambda: gray, lambda: face)
+    face.set_shape([224, 224, 3])
+
+    return tf.clip_by_value(face, 0.0, 1.0)
 
 def make_load_fn(split: str):
     do_aug = (split == "train")
@@ -359,7 +443,6 @@ def make_load_fn(split: str):
         face = tf.image.decode_jpeg(tf.io.read_file(face_p), channels=3)
         face = tf.cast(face, tf.float32) / 255.0
 
-        # flip_flag: 0.0 or 1.0
         flip_flag = (
             tf.cast(tf.random.uniform([]) > 0.5, tf.float32)
             if do_aug else tf.constant(0.0)
@@ -373,8 +456,15 @@ def make_load_fn(split: str):
                 lambda: face,
             )
 
-        dct = compute_dct_tf(face)
-        dct.set_shape([224, 224, 6])
+        # ── 웨이블릿 (DCT 대체) ───────────────────────────────────
+        # py_function: numpy 연산이라 CPU에서 실행, VRAM 영향 없음
+        flipped = flip_flag > 0.5
+        wav = tf.py_function(
+            lambda p, f: _load_wavelet(p, flip=bool(f.numpy() > 0.5)),
+            [face_p, flip_flag],
+            tf.float32,
+        )
+        wav.set_shape([N_BANDS, 14, 14, 3])             # (10, 14, 14, 3)
 
         face = (face - MEAN) / STD
         face.set_shape([224, 224, 3])
@@ -387,7 +477,7 @@ def make_load_fn(split: str):
         lm.set_shape([LM_FEAT_DIM])
 
         return (
-            {"face": face, "dct": dct, "lm": lm},
+            {"face": face, "wav": wav, "lm": lm},       # dct → wav
             tf.expand_dims(tf.cast(label, tf.float32), axis=-1),
         )
 
@@ -402,8 +492,8 @@ def mixup_batch(inputs, labels, alpha=0.2):
 
     mixed = {
         "face": lam * inputs["face"] + (1-lam) * tf.gather(inputs["face"], idx),
-        "dct" : lam * inputs["dct"]  + (1-lam) * tf.gather(inputs["dct"],  idx),
-        "lm"  : inputs["lm"],   # ← LM은 기하학적 피처라 MixUp 안 함
+        "wav" : lam * inputs["wav"]  + (1-lam) * tf.gather(inputs["wav"],  idx),  # dct→wav
+        "lm"  : inputs["lm"],
     }
     labels_f   = tf.cast(labels, tf.float32)
     labels_mix = lam * labels_f + (1-lam) * tf.cast(tf.gather(labels, idx), tf.float32)
@@ -482,51 +572,170 @@ def build_rgb_branch_fallback(img_size: int, embed_dim: int, freeze: bool) -> ke
 
 # ── 4-B. FAD (Frequency-Aware Discriminator, DCT Branch) ───────
 
-def build_fad_branch(img_size: int, embed_dim: int) -> keras.Model:
-    def cb(x, f, s, name):
-        x = layers.Conv2D(f, 3, s, padding="same", use_bias=False, name=f"{name}_c")(x)
-        x = layers.BatchNormalization(name=f"{name}_bn")(x)
-        return layers.Activation("relu", name=f"{name}_r")(x)
+# ── 4-B. WaveletSubbandViT (FAD 완전 대체) ─────────────────────
 
-    inp     = keras.Input(shape=(img_size, img_size, 6), name="dct")
-    low_inp = inp[:, :, :, :3]
-    hig_inp = inp[:, :, :, 3:]
+class BandPositionEmbedding(keras.layers.Layer):
+    """
+    서브밴드별 학습 가능한 위치 임베딩.
+    LL3(저주파)와 HH1(고주파)에 다른 임베딩 부여
+    → Transformer가 어떤 주파수 대역 토큰인지 인식
+    """
+    def __init__(self, n_bands: int, embed_dim: int, **kwargs):
+        super().__init__(**kwargs)
+        self.n_bands   = n_bands
+        self.embed_dim = embed_dim
 
-    lf = cb(low_inp, 32,  2, "lf1")
-    lf = cb(lf,      64,  2, "lf2")
-    lf = cb(lf,      128, 2, "lf3")
-    lf_gap = layers.GlobalAveragePooling2D(name="lf_gap")(lf)  # (B,128)
+    def build(self, input_shape):
+        self.pos_emb = self.add_weight(
+            shape=(1, self.n_bands, self.embed_dim),
+            initializer=keras.initializers.TruncatedNormal(stddev=0.02),
+            trainable=True,
+            name="band_position_embedding",
+        )
+        super().build(input_shape)
 
-    hf = cb(hig_inp, 32,  2, "hf1")
-    hf = cb(hf,      64,  2, "hf2")
-    hf = cb(hf,      128, 2, "hf3")
-    hf = cb(hf,      256, 2, "hf4")
-    hf = cb(hf,      256, 1, "hf5")
-    hf_gap = layers.GlobalAveragePooling2D(name="hf_gap")(hf)  # (B,256)
+    def call(self, x):
+        return tf.broadcast_to(self.pos_emb, tf.shape(x))
 
-    x = layers.Concatenate(name="fad_cat")([lf_gap, hf_gap])
-    x = layers.Dense(embed_dim, use_bias=False, name="fad_proj")(x)
-    x = layers.BatchNormalization(name="fad_bn")(x)
-    x = layers.Activation("relu", name="fad_relu")(x)
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"n_bands": self.n_bands, "embed_dim": self.embed_dim})
+        return cfg
 
-    # ← 수정: 출력 3개 (메인 임베딩 + 중간 피처 2개)
-    return keras.Model(inp, [x, lf_gap, hf_gap], name="fad_branch")
+
+class WavSubbandBlock(keras.layers.Layer):
+    """
+    Pre-Norm Transformer Block.
+    서브밴드 간 self-attention:
+      GAN   → HH 서브밴드에 체커보드 패턴 집중
+      Diffusion → 모든 서브밴드에 균일 분산
+    이 차이를 attention 가중치로 포착.
+    """
+    def __init__(self, embed_dim: int, num_heads: int,
+                 dropout: float = 0.1, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.dropout_r = dropout
+
+    def build(self, input_shape):
+        D, H = self.embed_dim, self.num_heads
+        self.ln1   = layers.LayerNormalization(epsilon=1e-6)
+        self.mha   = layers.MultiHeadAttention(
+            num_heads=H, key_dim=D // H, dropout=self.dropout_r
+        )
+        self.drop1 = layers.Dropout(self.dropout_r)
+        self.ln2   = layers.LayerNormalization(epsilon=1e-6)
+        self.ffn1  = layers.Dense(D * 4, activation="gelu")
+        self.ffn2  = layers.Dense(D)
+        self.drop2 = layers.Dropout(self.dropout_r)
+        super().build(input_shape)
+
+    def call(self, x, training=False):
+        h = self.ln1(x)
+        h = self.mha(h, h, training=training)
+        h = self.drop1(h, training=training)
+        x = x + h
+        h = self.ln2(x)
+        h = self.ffn2(self.ffn1(h))
+        h = self.drop2(h, training=training)
+        return x + h
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"embed_dim": self.embed_dim,
+                    "num_heads": self.num_heads,
+                    "dropout"  : self.dropout_r})
+        return cfg
+
+
+def build_wsv_branch(
+    n_bands    : int   = N_BANDS,
+    embed_dim  : int   = 256,
+    num_heads  : int   = 8,
+    num_layers : int   = 4,
+    dropout    : float = 0.1,
+) -> keras.Model:
+    """
+    입력: (B, 10, 14, 14, 3)
+    출력: [(B, embed_dim), (B, 128), (B, 128)]
+          메인 임베딩 + 저주파 aux + 고주파 aux
+          (aux 출력 유지로 aux_lf / aux_hf 헤드와 호환)
+    """
+    patch_dim = 14 * 14 * 3    # 588
+
+    inp = keras.Input(shape=(n_bands, 14, 14, 3), name="wav")
+
+    # 1. Flatten: (B, 10, 588)
+    x = layers.Reshape((n_bands, patch_dim), name="wav_flat")(inp)
+
+    # 2. Linear 임베딩
+    x = layers.TimeDistributed(
+        layers.Dense(embed_dim, use_bias=False), name="wav_proj"
+    )(x)
+    x = layers.LayerNormalization(name="wav_proj_ln")(x)   # (B, 10, embed_dim)
+
+    # 3. 밴드 위치 임베딩
+    pos = BandPositionEmbedding(n_bands, embed_dim, name="band_pos")(x)
+    x   = layers.Add(name="wav_pos_add")([x, pos])
+
+    # 4. Transformer 블록 (서브밴드 간 attention)
+    for i in range(num_layers):
+        x = WavSubbandBlock(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            name=f"wsv_block_{i}",
+        )(x)
+
+    # 5. 저주파(LL3~HH3, 0:4) / 고주파(HH2~HH1, 6:10) 분리 → aux용
+    lf_feat = layers.GlobalAveragePooling1D(name="wsv_lf_gap")(x[:, :4, :])   # (B,embed_dim)
+    hf_feat = layers.GlobalAveragePooling1D(name="wsv_hf_gap")(x[:, 6:, :])   # (B,embed_dim)
+
+    # 6. 전체 평균 풀링 → 메인 임베딩
+    out = layers.GlobalAveragePooling1D(name="wav_gap")(x)
+    out = layers.LayerNormalization(name="wav_out_ln")(out)   # (B, embed_dim)
+
+    return keras.Model(inp, [out, lf_feat, hf_feat], name="ws_vit")
 
 # ── 4-C. Geometric Landmark MLP ────────────────────────────────
 
 def build_lm_branch(feat_dim: int, embed_dim: int, dropout: float) -> keras.Model:
+    """
+    기존 MLP → Residual MLP
+    얕은 구조의 표현력 한계 해소
+    """
     inp = keras.Input(shape=(feat_dim,), name="lm")
-    x   = layers.Dense(128, use_bias=False)(inp)
-    x   = layers.BatchNormalization()(x)
-    x   = layers.Activation("relu")(x)
-    x   = layers.Dropout(dropout)(x)
-    x   = layers.Dense(64, use_bias=False)(x)
-    x   = layers.BatchNormalization()(x)
-    x   = layers.Activation("relu")(x)
-    x   = layers.Dropout(dropout * 0.5)(x)
-    x   = layers.Dense(embed_dim, use_bias=False)(x)
-    x   = layers.BatchNormalization()(x)
-    x   = layers.Activation("relu")(x)
+
+    # 입력 정규화
+    x = layers.LayerNormalization()(inp)
+
+    # Block 1
+    x = layers.Dense(256, use_bias=False)(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("gelu")(x)
+    x = layers.Dropout(dropout)(x)
+
+    # Block 2 + Residual
+    skip = layers.Dense(128, use_bias=False)(x)
+    x    = layers.Dense(128, use_bias=False)(x)
+    x    = layers.BatchNormalization()(x)
+    x    = layers.Activation("gelu")(x)
+    x    = layers.Dropout(dropout * 0.5)(x)
+    x    = layers.Add()([x, skip])
+
+    # Block 3 + Residual
+    skip = x
+    x    = layers.Dense(128, use_bias=False)(x)
+    x    = layers.BatchNormalization()(x)
+    x    = layers.Activation("gelu")(x)
+    x    = layers.Add()([x, skip])
+
+    # 출력
+    x = layers.Dense(embed_dim, use_bias=False)(x)
+    x = layers.LayerNormalization()(x)
+    x = layers.Activation("gelu")(x)
+
     return keras.Model(inp, x, name="lm_branch")
 
 
@@ -575,42 +784,75 @@ def cross_attention_2(feat_a, feat_b, dim, name):
     fused = layers.LayerNormalization(name=f"{name}_oln")(fused)
     return fused                            # (B,dim)
 
-
 class CrossAttention3Way(keras.layers.Layer):
+    """
+    기존 CrossAttention3Way 개선:
+    각 모달리티의 신뢰도를 게이트로 학습
+    → 약한 브랜치(DCT/LM)가 노이즈로 작용하는 것을 방지
+    """
     def __init__(self, dim, name=None, **kwargs):
         super().__init__(name=name, **kwargs)
         self.dim = dim
-        _n = name or "ca3"
-        self.mha = layers.MultiHeadAttention(num_heads=4, key_dim=dim // 4, name=f"{_n}_mha")
-        self.ln1 = layers.LayerNormalization(name=f"{_n}_ln1")  # ← name → _n
-        self.dense = layers.Dense(dim, use_bias=False, name=f"{_n}_out")  # ← name → _n
-        self.ln2 = layers.LayerNormalization(name=f"{_n}_ln2")  # ← name → _n
+        _n = name or "gca3"
+        self.mha   = layers.MultiHeadAttention(
+            num_heads=8, key_dim=dim // 8, name=f"{_n}_mha"  # 헤드 수 4→8
+        )
+        self.ln1   = layers.LayerNormalization(name=f"{_n}_ln1")
+        self.dense = layers.Dense(dim, use_bias=False, name=f"{_n}_out")
+        self.ln2   = layers.LayerNormalization(name=f"{_n}_ln2")
+        self.pool_query = layers.Dense(1, use_bias=False, name=f"{_n}_pool_q")
 
-    def build(self, input_shape):  # ⬅️ 오타 수정: (self, input_shape) 로 닫기
-        # 3개의 모달리티(RGB, DCT, LM)를 구분하는 학습 가능한 이름표(Embedding)
+        # ── 추가: 모달리티별 게이트 ──────────────────────────────
+        # 각 브랜치가 현재 샘플에서 얼마나 신뢰할 수 있는지 학습
+        self.gate_rgb = layers.Dense(1, activation="sigmoid", name=f"{_n}_g_rgb")
+        self.gate_dct = layers.Dense(1, activation="sigmoid", name=f"{_n}_g_dct")
+        self.gate_lm  = layers.Dense(1, activation="sigmoid", name=f"{_n}_g_lm")
+
+        # FFN (기존엔 없었음)
+        self.ffn1 = layers.Dense(dim * 2, activation="gelu", name=f"{_n}_ffn1")
+        self.ffn2 = layers.Dense(dim,     use_bias=False,    name=f"{_n}_ffn2")
+        self.ln3  = layers.LayerNormalization(name=f"{_n}_ln3")
+
+    def build(self, input_shape):
         self.modality_emb = self.add_weight(
             shape=(1, 3, self.dim),
             initializer="random_normal",
             trainable=True,
-            name="modality_embedding"
+            name="modality_embedding",
         )
         super().build(input_shape)
 
-    def call(self, inputs):  # ⬅️ Keras 규칙에 맞게 하나의 리스트(inputs)로 받음
+    def call(self, inputs):
         feat_r, feat_d, feat_l = inputs
 
-        # 1. 3개 토큰 스택: (B, 3, dim)
-        seq = tf.stack([feat_r, feat_d, feat_l], axis=1)
+        # 1. 게이트로 각 브랜치 신뢰도 조절
+        g_r = self.gate_rgb(feat_r)  # (B, 1)
+        g_d = self.gate_dct(feat_d)
+        g_l = self.gate_lm(feat_l)
 
-        # 2. 이름표(Modality Embedding) 부착! (성능 상승의 핵심)
+        feat_r = feat_r * g_r
+        feat_d = feat_d * g_d
+        feat_l = feat_l * g_l
+
+        # 2. 스택 + Modality Embedding
+        seq     = tf.stack([feat_r, feat_d, feat_l], axis=1)  # (B,3,dim)
         seq_emb = seq + self.modality_emb
 
         # 3. Self-Attention
         attn = self.mha(query=seq_emb, key=seq_emb, value=seq)
-        out = self.ln1(seq + attn)
+        out  = self.ln1(seq + attn)
 
-        # 4. 평균 풀링 및 최종 출력
-        fused = tf.reduce_mean(out, axis=1)
+        # 4. FFN (기존 대비 추가)
+        ffn  = self.ffn2(self.ffn1(out))
+        out  = self.ln3(out + ffn)
+
+        # 5. 평균 풀링
+        attn_score = tf.nn.softmax(
+            self.pool_query(out), axis=1
+        )
+        fused = tf.reduce_sum(
+            out * attn_score, axis=1
+        )
         fused = self.dense(fused)
         return self.ln2(fused)
 
@@ -648,7 +890,7 @@ class UncertaintyWeights(keras.layers.Layer):
             name: self.add_weight(
                 name=f"log_var_{name}",
                 shape=(),
-                initializer="zeros",
+                initializer=keras.initializers.Constant(0.5),
                 trainable=True,
                 dtype=tf.float32,
             )
@@ -659,7 +901,7 @@ class UncertaintyWeights(keras.layers.Layer):
         return inputs   # 통과만 함 (가중치 보관 목적)
 
     def get_log_var(self, name):
-        return self.log_vars[name]
+        return tf.clip_by_value(self.log_vars[name], -2.0, 2.0)
 
     def get_config(self):
         cfg = super().get_config()
@@ -684,54 +926,65 @@ def build_inner_model(cfg: dict) -> keras.Model:
     wd       = cfg["weight_decay"]
     reg      = keras.regularizers.l2(wd)
     hidden   = cfg["head_hidden"]
-    attn_dim = cfg["attn_dim"]   # ← 전역 ATTN_DIM 대신 지역변수 사용
+    attn_dim = cfg["attn_dim"]
 
     if CLIP_AVAILABLE:
         rgb_ext = build_rgb_branch(img_size, cfg["rgb_embed_dim"],
-                                    cfg["freeze_backbone"])
+                                   cfg["freeze_backbone"])
     else:
         rgb_ext = build_rgb_branch_fallback(img_size, cfg["rgb_embed_dim"],
-                                             cfg["freeze_backbone"])
-    dct_ext = build_fad_branch(img_size, cfg["dct_embed_dim"])
-    lm_ext  = build_lm_branch(LM_FEAT_DIM, cfg["lm_embed_dim"], dropout)
+                                            cfg["freeze_backbone"])
+
+    # FAD → WS-ViT
+    wav_ext = build_wsv_branch(
+        n_bands   = N_BANDS,
+        embed_dim = cfg["wav_embed_dim"],
+        num_heads = cfg["wav_num_heads"],
+        num_layers= cfg["wav_num_layers"],
+    )
+    lm_ext = build_lm_branch(LM_FEAT_DIM, cfg["lm_embed_dim"], dropout)
 
     inp_face = keras.Input(shape=(img_size, img_size, 3), name="face")
-    inp_dct  = keras.Input(shape=(img_size, img_size, 6), name="dct")
+    inp_wav  = keras.Input(shape=(N_BANDS, 14, 14, 3),   name="wav")  # ← dct→wav
     inp_lm   = keras.Input(shape=(LM_FEAT_DIM,),          name="lm")
 
-    rgb_raw = rgb_ext(inp_face)
-    dct_raw, lf_raw, hf_raw = dct_ext(inp_dct)
-    lm_raw  = lm_ext(inp_lm)
+    rgb_raw             = rgb_ext(inp_face)
+    wav_raw, lf_raw, hf_raw = wav_ext(inp_wav)            # ← 3 outputs
+    lm_raw              = lm_ext(inp_lm)
 
-    # ← attn_dim 지역변수로 교체
     rgb_p = project_feat(rgb_raw, attn_dim, "rgb")
-    dct_p = project_feat(dct_raw, attn_dim, "dct")
+    wav_p = project_feat(wav_raw, attn_dim, "wav")        # ← dct_p → wav_p
     lm_p  = project_feat(lm_raw,  attn_dim, "lm")
 
     outputs = {}
     outputs["rgb"]     = build_head(rgb_p, "h_rgb",     hidden, dropout, reg)
-    outputs["dct"]     = build_head(dct_p, "h_dct",     hidden, dropout, reg)
+    outputs["wav"]     = build_head(wav_p, "h_wav",     hidden, dropout, reg)
     outputs["lm"]      = build_head(lm_p,  "h_lm",      hidden, dropout, reg)
 
-    rd = cross_attention_2(rgb_p, dct_p, attn_dim, "ca_rd")
-    outputs["rgb_dct"] = build_head(rd,   "h_rgb_dct",  hidden, dropout, reg)
+    rw = cross_attention_2(rgb_p, wav_p, attn_dim, "ca_rw")
+    outputs["rgb_wav"] = build_head(rw, "h_rgb_wav", hidden, dropout, reg)
 
-    rl = cross_attention_2(rgb_p, lm_p,  attn_dim, "ca_rl")
-    outputs["rgb_lm"]  = build_head(rl,   "h_rgb_lm",   hidden, dropout, reg)
+    rl = cross_attention_2(rgb_p, lm_p, attn_dim, "ca_rl")
+    outputs["rgb_lm"]  = build_head(rl, "h_rgb_lm",  hidden, dropout, reg)
 
-    dl = cross_attention_2(dct_p, lm_p,  attn_dim, "ca_dl")
-    outputs["dct_lm"]  = build_head(dl,   "h_dct_lm",   hidden, dropout, reg)
+    wl = cross_attention_2(wav_p, lm_p, attn_dim, "ca_wl")
+    outputs["wav_lm"]  = build_head(wl, "h_wav_lm",  hidden, dropout, reg)
 
-    all_f = CrossAttention3Way(attn_dim, name="ca_all")([rgb_p, dct_p, lm_p])
-    outputs["all"]     = build_head(all_f, "h_all",      hidden, dropout, reg)
+    # Hierarchical: rgb+wav 먼저 융합 → lm과 최종 융합
+    rw_fused    = cross_attention_2(rgb_p, wav_p, attn_dim, "ca_hier_rw")
+    rwl_fused   = cross_attention_2(rw_fused, lm_p, attn_dim, "ca_hier_rwl")
+    all_f       = CrossAttention3Way(attn_dim, name="ca_all")(
+        [rgb_p, rwl_fused, lm_p]
+    )
+    outputs["all"] = build_head(all_f, "h_all", hidden, dropout, reg)
 
-    outputs["aux_lf"]  = build_aux_head(lf_raw, "aux_lf", reg)
-    outputs["aux_hf"]  = build_aux_head(hf_raw, "aux_hf", reg)
+    outputs["aux_lf"] = build_aux_head(lf_raw, "aux_lf", reg)
+    outputs["aux_hf"] = build_aux_head(hf_raw, "aux_hf", reg)
 
     return keras.Model(
-        inputs  = {"face": inp_face, "dct": inp_dct, "lm": inp_lm},
+        inputs  = {"face": inp_face, "wav": inp_wav, "lm": inp_lm},
         outputs = outputs,
-        name    = "inner_7head",
+        name    = "inner_wsv",
     )
 
 # ═══════════════════════════════════════════════════════════════
@@ -793,33 +1046,32 @@ class DeepfakeDetector(keras.Model):
         x, y = data
         with tf.GradientTape() as tape:
             y_pred = self(x, training=True)
-            loss   = self._uncertainty_loss(y, y_pred)
-            scaled_loss = self.optimizer.get_scaled_loss(loss)
+            loss = self._uncertainty_loss(y, y_pred)
+            scaled_loss = self.optimizer.get_scaled_loss(loss)  # ← 이제 정상 작동
 
         scaled_grads = tape.gradient(scaled_loss, self.trainable_variables)
         grads = self.optimizer.get_unscaled_gradients(scaled_grads)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
-        # 소프트 레이블 → 하드 (메트릭용)
         y_hard = tf.cast(y >= 0.5, tf.float32)
         self.loss_tracker.update_state(loss)
         self.auc_metric.update_state(y_hard, y_pred["all"])
         self.acc_metric.update_state(y_hard, y_pred["all"])
         self.precision_metric.update_state(y_hard, y_pred["all"])
         self.recall_metric.update_state(y_hard, y_pred["all"])
-
         return {m.name: m.result() for m in self.metrics}
 
     def test_step(self, data):
         x, y   = data
         y_pred = self(x, training=False)
         loss   = self._uncertainty_loss(y, y_pred)
+        y_hard = tf.cast(y >= 0.5, tf.float32)
 
         self.loss_tracker.update_state(loss)
-        self.auc_metric.update_state(y, y_pred["all"])
-        self.acc_metric.update_state(y, y_pred["all"])
-        self.precision_metric.update_state(y, y_pred["all"])
-        self.recall_metric.update_state(y, y_pred["all"])
+        self.auc_metric.update_state(y_hard, y_pred["all"])
+        self.acc_metric.update_state(y_hard, y_pred["all"])
+        self.precision_metric.update_state(y_hard, y_pred["all"])
+        self.recall_metric.update_state(y_hard, y_pred["all"])
 
         return {m.name: m.result() for m in self.metrics}
 
@@ -861,6 +1113,24 @@ class WarmupCosineDecay(keras.optimizers.schedules.LearningRateSchedule):
 # 10. Callbacks
 # ═══════════════════════════════════════════════════════════════
 
+
+class SmartEarlyStopping(keras.callbacks.EarlyStopping):
+    """Resume 시 이전 best val_auc를 복원하는 EarlyStopping"""
+    def __init__(self, initial_best=None, **kwargs):
+        super().__init__(**kwargs)
+        self.initial_best = initial_best
+
+    def on_train_begin(self, logs=None):
+        super().on_train_begin(logs)
+        if self.initial_best is not None:
+            self.best = self.initial_best
+            log.info(f"EarlyStopping best 복원: {self.best:.4f}")
+
+def parse_best_auc_from_ckpt(ckpt_path: str) -> float:
+    """체크포인트 파일명에서 val_auc 파싱"""
+    m = re.search(r"valauc([\d.]+?)(?=\.index|$)", ckpt_path)
+    return float(m.group(1)) if m else None
+
 def _unfreeze_all(m):
     """재귀적으로 모든 레이어 unfreeze (CLIP 포함)"""
     m.trainable = True
@@ -882,13 +1152,16 @@ class BackboneUnfreezeCallback(keras.callbacks.Callback):
         if epoch == self.unfreeze_epoch and not self._unfrozen:
             _unfreeze_all(self.model)
 
-            current_step = self.model.optimizer.iterations
-            sched        = self.model.optimizer.learning_rate
-            current_lr   = float(sched(current_step)) if callable(sched) else float(sched)
-            new_lr       = current_lr * self.lr_scale
+            # LossScaleOptimizer 대응
+            opt = self.model.optimizer
+            inner_opt = opt.inner_optimizer if hasattr(opt, "inner_optimizer") else opt
 
-            # 스케줄러를 고정값으로 교체 (unfreeze 후엔 낮은 lr로 fine-tune)
-            self.model.optimizer.learning_rate = new_lr
+            current_lr = float(inner_opt.learning_rate(inner_opt.iterations)
+                               if callable(inner_opt.learning_rate)
+                               else inner_opt.learning_rate)
+            new_lr = current_lr * self.lr_scale
+            inner_opt.learning_rate = new_lr
+
             self._unfrozen = True
             log.info(f"Epoch {epoch}: backbone unfreeze | "
                      f"lr {current_lr:.2e} → {new_lr:.2e}")
@@ -898,7 +1171,7 @@ class LogUncertaintyCallback(keras.callbacks.Callback):
     """에폭 끝마다 각 헤드의 log_var(불확실성) 출력"""
     def on_epoch_end(self, epoch, logs=None):
         lv = {
-            name: float(self.model.uw_layer.get_log_var(name))
+            name: float(self.model.uw_layer.get_log_var(name).numpy())
             for name in HEAD_NAMES
         }
         log.info(
@@ -908,33 +1181,38 @@ class LogUncertaintyCallback(keras.callbacks.Callback):
 
 
 def _get_lr(model):
-    sched = model.optimizer.learning_rate
+    opt = model.optimizer
+    # LossScaleOptimizer 내부의 실제 optimizer 꺼내기
+    if hasattr(opt, "inner_optimizer"):
+        opt = opt.inner_optimizer
+    sched = opt.learning_rate
     if callable(sched):
-        return float(sched(model.optimizer.iterations))
+        return float(sched(opt.iterations))
     return float(sched)
 
 
-def build_callbacks(cfg: dict, model) -> list:
+def build_callbacks(cfg: dict, model, initial_best_auc=None) -> list:
     os.makedirs(cfg["ckpt_dir"], exist_ok=True)
     return [
         keras.callbacks.ModelCheckpoint(
-            filepath          = os.path.join(
+            filepath=os.path.join(
                 cfg["ckpt_dir"],
                 "best_epoch{epoch:03d}_valauc{val_auc:.4f}",
             ),
-            monitor           = "val_auc",
-            mode              = "max",
-            save_best_only    = True,
-            save_weights_only = True,
-            verbose           = 1,
+            monitor="val_auc",
+            mode="max",
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1,
         ),
-        keras.callbacks.EarlyStopping(
-            monitor              = "val_auc",
-            mode                 = "max",
-            patience             = 12,
-            restore_best_weights = True,
-            verbose              = 1,
-            min_delta            = 0.001,
+        SmartEarlyStopping(
+            initial_best=initial_best_auc,
+            monitor="val_auc",
+            mode="max",
+            patience=25,
+            restore_best_weights=True,
+            verbose=1,
+            min_delta=0.001,
         ),
         BackboneUnfreezeCallback(
             unfreeze_epoch = cfg["unfreeze_epoch"],
@@ -958,30 +1236,48 @@ def build_callbacks(cfg: dict, model) -> list:
 # 11. 평가 — Ablation Table 자동 생성
 # ═══════════════════════════════════════════════════════════════
 
-# HEAD_NAMES, AUX_HEAD_NAMES 아래에 추가
+HEAD_NAMES     = ["rgb", "wav", "lm", "rgb_wav", "rgb_lm", "wav_lm", "all"]
+AUX_HEAD_NAMES = ["aux_lf", "aux_hf"]
 ALL_EVAL_HEADS = HEAD_NAMES + AUX_HEAD_NAMES
 
-
-def evaluate_model(model: DeepfakeDetector, test_ds, tag="Test"):
-    preds_all  = {name: [] for name in ALL_EVAL_HEADS}  # ← 수정
+def evaluate_model(model: DeepfakeDetector, test_ds, tag="Test", n_tta=8):
+    preds_all  = {name: [] for name in ALL_EVAL_HEADS}
     labels_all = []
 
     for inputs, labels in test_ds:
-        batch_out = model(inputs, training=False)
-        for name in ALL_EVAL_HEADS:                       # ← 수정
-            preds_all[name].append(batch_out[name].numpy().flatten())
+        tta_preds = {name: [] for name in ALL_EVAL_HEADS}
+
+        for i in range(n_tta):
+            # 짝수 회차: flip, 홀수 회차: 원본
+            do_flip   = (i % 2 == 0)
+            aug_face  = tf.image.flip_left_right(inputs["face"]) \
+                        if do_flip else inputs["face"]
+            aug_inputs = {"face": aug_face,
+                          "dct" : inputs["dct"],
+                          "lm"  : inputs["lm"]}
+
+            out = model(aug_inputs, training=False)
+            for name in ALL_EVAL_HEADS:
+                tta_preds[name].append(out[name].numpy())
+
+        for name in ALL_EVAL_HEADS:
+            # 기하 평균 앙상블
+            stack = np.stack(tta_preds[name], axis=0)          # (n_tta, B, 1)
+            geo   = np.exp(np.mean(np.log(stack + 1e-8), axis=0))
+            preds_all[name].append(geo.flatten())
+
         labels_all.append(labels.numpy().flatten())
 
     y_true = np.concatenate(labels_all)
 
     log.info(f"\n{'='*62}")
-    log.info(f"  [{tag}]  Ablation Table")
+    log.info(f"  [{tag}]  Ablation Table  (TTA x{n_tta})")
     log.info(f"{'='*62}")
     log.info(f"  {'Head':<12}  {'AUC':>6}  {'F1':>6}  {'ACC':>6}  {'Thr':>5}")
     log.info(f"  {'-'*46}")
 
     results = {}
-    for name in ALL_EVAL_HEADS:                           # ← 수정
+    for name in ALL_EVAL_HEADS:
         y_prob = np.concatenate(preds_all[name])
         auc_m  = keras.metrics.AUC()
         auc_m.update_state(y_true, y_prob)
@@ -1002,7 +1298,6 @@ def evaluate_model(model: DeepfakeDetector, test_ds, tag="Test"):
         y_pred = (y_prob >= best_thr).astype(int)
         acc    = np.mean(y_pred == y_true.astype(int))
 
-        # ← 마커 구분
         if name == "all":
             marker = "  ★ MAIN"
         elif name in AUX_HEAD_NAMES:
@@ -1073,37 +1368,78 @@ def main():
     log.info("=" * 60)
     log.info("STEP 7: 컴파일")
     steps_per_epoch = len(splits["train"]) // bs
-    total_steps     = steps_per_epoch * cfg["epochs"]
-    warmup_steps    = steps_per_epoch * cfg["warmup_epochs"]
+    total_steps = steps_per_epoch * cfg["epochs"]
+    warmup_steps = steps_per_epoch * cfg["warmup_epochs"]
 
-    schedule  = WarmupCosineDecay(
-        cfg["lr_init"], cfg["lr_min"],
-        int(warmup_steps), int(total_steps)
-    )
-    optimizer = keras.optimizers.Adam(learning_rate=schedule, clipnorm=1.0)
+    # STEP 7.5: 가중치 로드 (컴파일 전에 resume 여부 파악)
+    saved_ckpts = sorted(glob.glob(os.path.join(cfg["ckpt_dir"], "best_epoch*.index")))
+    initial_best_auc = None
+    is_resume = bool(saved_ckpts)
+
+    # Resume이면 lr을 낮게 시작, 처음이면 정상 스케줄
+    if is_resume:
+        resume_lr_init = cfg["lr_init"] * 0.05  # 기존의 5%
+        resume_warmup = steps_per_epoch * 2  # 2에폭 재웜업
+        schedule = WarmupCosineDecay(
+            resume_lr_init, cfg["lr_min"],
+            int(resume_warmup),
+            int(steps_per_epoch * cfg["epochs"]),
+        )
+        log.info(f"Resume 모드: lr_init {cfg['lr_init']:.2e} → {resume_lr_init:.2e}")
+    else:
+        schedule = WarmupCosineDecay(
+            cfg["lr_init"], cfg["lr_min"],
+            int(warmup_steps), int(total_steps),
+        )
+
+    base_optimizer = keras.optimizers.Adam(learning_rate=schedule, clipnorm=1.0)
+    optimizer = keras.mixed_precision.LossScaleOptimizer(base_optimizer)
     model.compile(optimizer=optimizer)
 
-    log.info(f"steps/epoch={steps_per_epoch:,}  "
-             f"total={total_steps:,}  warmup={warmup_steps:,}")
+    log.info(f"steps/epoch={steps_per_epoch:,}  total={total_steps:,}  warmup={warmup_steps:,}")
+
+    if is_resume:
+        latest_ckpt = saved_ckpts[-1].replace(".index", "")
+        initial_best_auc = parse_best_auc_from_ckpt(saved_ckpts[-1])
+        log.info(f"가중치 로드: {latest_ckpt}  (best_auc={initial_best_auc})")
+        model.load_weights(latest_ckpt).expect_partial()
+        log.info("✅ 가중치 로드 완료")
+    else:
+        log.info("새 학습 시작")
 
     # STEP 8: 학습
+    initial_epoch = 0
+    if is_resume:
+        m = re.search(r"best_epoch(\d+)", saved_ckpts[-1])
+        initial_epoch = int(m.group(1)) if m else 0
+        log.info(f"Epoch {initial_epoch}부터 재개")
+
     log.info("=" * 60)
     log.info("STEP 8: 학습 시작")
-    t0      = time.time()
+    t0 = time.time()
     history = model.fit(
         train_ds,
-        validation_data = val_ds,
-        epochs          = cfg["epochs"],
-        callbacks       = build_callbacks(cfg, model),
-        verbose         = 1,
+        validation_data=val_ds,
+        epochs=cfg["epochs"],
+        initial_epoch=initial_epoch,
+        callbacks=build_callbacks(cfg, model, initial_best_auc),  # ← 전달
+        verbose=1,
     )
-    log.info(f"학습 완료 — {(time.time()-t0)/3600:.2f}h")
+    log.info(f"학습 완료 — {(time.time() - t0) / 3600:.2f}h")
 
     # STEP 9: 평가
     log.info("=" * 60)
     log.info("STEP 9: 최종 평가")
     int_res = evaluate_model(model, int_test_ds, "Internal (FF++/DFF/HIDF)")
-    ext_res = evaluate_model(model, ext_test_ds, "External (CelebDF/redface)")
+
+    ext_res = {}  # ← 수정
+    for ds_name in cfg["test_datasets"]:
+        ds_samples = collect_samples(cfg["processed_root"], [ds_name])
+        if not ds_samples:
+            log.warning(f"[{ds_name}] 샘플 없음 — 스킵")
+            continue
+        ds_test = build_tf_dataset(ds_samples, "test", bs, seed)
+        ext_res[ds_name] = evaluate_model(model, ds_test, f"External [{ds_name}]")  # ← 수정
 
     # STEP 10: 저장
     final_path = os.path.join(cfg["ckpt_dir"], f"final_{_ts}")

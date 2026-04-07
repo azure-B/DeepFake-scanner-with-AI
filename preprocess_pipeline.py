@@ -114,12 +114,21 @@ MP_REGIONS = {
 
 def parse_dff(root: str):
     samples, root = [], Path(root)
-    for p in (root / "real").rglob("*.jpg"):
+
+    # wiki 폴더 전체 = real (label=0)
+    for p in (root / "wiki").rglob("*.jpg"):
         samples.append((str(p), 0))
-    for fake_dir in ["inpainting", "insight", "text2img"]:
-        for p in (root / fake_dir).rglob("*.jpg"):
+
+    # wiki 제외 나머지 폴더 전체 = fake (label=1)
+    for fake_dir in root.iterdir():
+        if fake_dir.name == "wiki" or not fake_dir.is_dir():
+            continue
+        for p in fake_dir.rglob("*.jpg"):
             samples.append((str(p), 1))
-    log.info(f"[DFF] {len(samples)} samples")
+
+    nr = sum(1 for _, l in samples if l == 0)
+    nf = sum(1 for _, l in samples if l == 1)
+    log.info(f"[DFF] real={nr:,}  fake={nf:,}  total={len(samples):,}")
     return samples
 
 
@@ -137,32 +146,75 @@ def parse_ffpp(root: str):
 
     return samples
 
-def parse_redface(root: str):
+def parse_redface(root: str) -> list:
     """
-    redface 구조:
+    redface 폴더 구조:
       root/
-        Original/   → real (label 0)
-        EFS/        → Entire Face Synthesis  (label 1)
-        FAM/        → Face Attribute Manipulation (label 1)
-        FR/         → Face Reenactment (label 1)
-        FS/         → Face Swapping (label 1)
+        Original/              → real (label 0) — 하위 폴더 없이 파일 직접 존재
+        EFS/{train,valid,test}/ → fake (label 1)
+        FAM/{train,valid,test}/ → fake (label 1)
+        FR/{train,valid,test}/  → fake (label 1)
+        FS/{train,valid,test}/  → fake (label 1)
     """
-    samples, root = [], Path(root)
+    FAKE_DIRS = ["EFS", "FAM", "FR", "FS"]
+    SPLITS    = ["train", "valid", "test"]
+    EXTS      = {".jpg", ".jpeg", ".png", ".mp4"}
+    root      = Path(root)
+    samples   = []
 
-    # 진짜
-    for ext in ["*.jpg", "*.jpeg", "*.png", "*.mp4"]:
-        for p in (root / "Original").glob(ext):
+    # ── Real: Original/ 바로 아래 파일만 ─────────────────────────────────
+    orig_dir = root / "Original"
+    if not orig_dir.exists():
+        log.error(f"[redface] Original 폴더 없음: {orig_dir}")
+    else:
+        real_files = [
+            p for p in sorted(orig_dir.iterdir())
+            if p.is_file() and p.suffix.lower() in EXTS
+        ]
+        for p in real_files:
             samples.append((str(p), 0))
+        log.info(f"[redface] Original(real): {len(real_files):,}개")
 
-    # 가짜 4종
-    for fake_dir in ["EFS", "FAM", "FR", "FS"]:
-        for ext in ["*.jpg", "*.jpeg", "*.png", "*.mp4"]:
-            for p in (root / fake_dir).glob(ext):
-                samples.append((str(p), 1))
+    # ── Fake 4종: 각각 train/valid/test 하위 폴더 순회 ──────────────────
+    cat_counts = {}
+    for fake_dir in FAKE_DIRS:
+        d = root / fake_dir
+        if not d.exists():
+            log.warning(f"[redface] {fake_dir}/ 폴더 없음 — 스킵")
+            cat_counts[fake_dir] = 0
+            continue
 
-    log.info(f"[redface] {len(samples)} samples  "
-             f"(real={sum(1 for _,l in samples if l==0)}, "
-             f"fake={sum(1 for _,l in samples if l==1)})")
+        cat_files = []
+        for split in SPLITS:
+            split_dir = d / split
+            if not split_dir.exists():
+                log.warning(f"[redface] {fake_dir}/{split}/ 없음 — 스킵")
+                continue
+            files = [
+                p for p in sorted(split_dir.iterdir())
+                if p.is_file() and p.suffix.lower() in EXTS
+            ]
+            cat_files.extend(files)
+
+        for p in cat_files:
+            samples.append((str(p), 1))
+        cat_counts[fake_dir] = len(cat_files)
+
+    # ── 요약 로그 ─────────────────────────────────────────────────────────
+    n_real = sum(1 for _, l in samples if l == 0)
+    n_fake = sum(1 for _, l in samples if l == 1)
+    log.info(
+        f"[redface] total={len(samples):,}  "
+        f"real={n_real:,}  fake={n_fake:,}"
+    )
+    for cat, cnt in cat_counts.items():
+        log.info(f"  {cat:<6}: {cnt:,}개")
+
+    if n_fake == 0:
+        log.error("[redface] fake 0개 — 폴더 구조 재확인 필요")
+    if n_real == 0:
+        log.error("[redface] real 0개 — Original/ 재확인 필요")
+
     return samples
 
 def parse_celebdf(root: str):
@@ -426,6 +478,147 @@ def save_sample(out_dir: Path, stem: str, face: np.ndarray,
 
 
 # ─────────────────────────────────────────────
+# SBI (Self-Blended Images) 합성
+# ─────────────────────────────────────────────
+
+def _get_face_mask(lm: np.ndarray, img_size: int = 224) -> np.ndarray:
+    """랜드마크 convex hull 기반 얼굴 마스크 생성"""
+    mask = np.zeros((img_size, img_size), dtype=np.float32)
+    hull = cv2.convexHull(lm.astype(np.int32))
+    cv2.fillConvexPoly(mask, hull, 1.0)
+
+    # 경계 부드럽게 (블렌딩 아티팩트 자연스럽게)
+    mask = cv2.GaussianBlur(mask, (21, 21), sigmaX=5, sigmaY=5)
+    return mask
+
+
+def _random_color_shift(img: np.ndarray) -> np.ndarray:
+    """채널별 독립 색상 이동 → 피부톤 불일치 아티팩트 시뮬레이션"""
+    img = img.astype(np.float32)
+    for c in range(3):
+        img[:, :, c] *= np.random.uniform(0.75, 1.25)
+        img[:, :, c] += np.random.uniform(-15, 15)
+    return np.clip(img, 0, 255)
+
+
+def _random_affine(img: np.ndarray) -> np.ndarray:
+    """약한 기하학적 변환 → 경계 불일치 아티팩트 시뮬레이션"""
+    h, w = img.shape[:2]
+    cx, cy = w / 2, h / 2
+
+    angle = np.random.uniform(-5, 5)
+    scale = np.random.uniform(0.95, 1.05)
+    tx = np.random.uniform(-5, 5)
+    ty = np.random.uniform(-5, 5)
+
+    M = cv2.getRotationMatrix2D((cx, cy), angle, scale)
+    M[0, 2] += tx
+    M[1, 2] += ty
+
+    return cv2.warpAffine(img, M, (w, h),
+                          flags=cv2.INTER_LINEAR,
+                          borderMode=cv2.BORDER_REFLECT)
+
+
+def _random_freq_distort(img: np.ndarray) -> np.ndarray:
+    """
+    주파수 영역 왜곡
+    실제 deepfake 압축/업스케일 아티팩트와 유사한 패턴 생성
+    """
+    method = np.random.randint(0, 3)
+
+    if method == 0:
+        # 다운샘플 → 업샘플
+        scale = np.random.choice([0.4, 0.5, 0.6])
+        h, w = img.shape[:2]
+        small = cv2.resize(img,
+                           (int(w * scale), int(h * scale)),
+                           interpolation=cv2.INTER_LINEAR)
+        return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    elif method == 1:
+        # JPEG 압축 아티팩트
+        q = int(np.random.randint(30, 70))
+        _, enc = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, q])
+        return cv2.imdecode(enc, cv2.IMREAD_COLOR)
+
+    else:
+        # 가우시안 블러
+        k = np.random.choice([3, 5, 7])
+        return cv2.GaussianBlur(img, (k, k), sigmaX=0)
+
+
+from typing import Optional
+
+def generate_sbi(face_bgr: np.ndarray,
+                 lm: np.ndarray,
+                 blend_alpha_range: tuple = (0.4, 0.8)) -> Optional[np.ndarray]:
+
+    """
+    SBI (Self-Blended Images) 합성
+
+    real 이미지 1장 → fake 이미지 1장 생성
+
+    Parameters
+    ----------
+    face_bgr : (224, 224, 3) uint8 BGR
+    lm       : (68, 2) float32 픽셀 좌표
+
+    Returns
+    -------
+    blended  : (224, 224, 3) uint8 또는 None (실패 시)
+    """
+    try:
+        # 1. 소스 이미지 변형 (색상 + 기하 + 주파수)
+        src = face_bgr.copy()
+        src = _random_color_shift(src).astype(np.uint8)
+        src = _random_affine(src)
+        src = _random_freq_distort(src)
+
+        # 2. 얼굴 마스크 (경계 부드럽게)
+        mask = _get_face_mask(lm)  # (224,224) float32 0~1
+        alpha = np.random.uniform(*blend_alpha_range)
+        mask = (mask * alpha)[:, :, np.newaxis]  # (224,224,1)
+
+        # 3. 마스크 영역만 블렌딩
+        blended = (mask * src.astype(np.float32)
+                   + (1 - mask) * face_bgr.astype(np.float32))
+        return blended.astype(np.uint8)
+
+    except Exception as e:
+        log.debug(f"SBI 생성 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# run_pipeline 내부의 save_sample 호출부를
+# 아래 함수로 교체
+# ─────────────────────────────────────────────
+
+def save_sample_with_sbi(out_root: Path, ds_key: str,
+                         stem: str, face_bgr: np.ndarray,
+                         lm: np.ndarray, label: int,
+                         sbi_prob: float = 0.5):
+    """
+    원본 샘플 저장 + real 샘플이면 SBI fake 샘플도 생성
+
+    sbi_prob : real 샘플 1개당 SBI 샘플 생성 확률
+               (데이터셋 크기 조절용, 기본 50%)
+    """
+    # 원본 저장
+    out_dir = out_root / ds_key / str(label)
+    save_sample(out_dir, stem, face_bgr, lm)
+
+    # real 샘플에만 SBI 적용
+    if label == 0 and np.random.rand() < sbi_prob:
+        sbi_face = generate_sbi(face_bgr, lm)
+        if sbi_face is not None:
+            sbi_dir = out_root / ds_key / "1"  # label=1 (fake)
+            sbi_stem = f"{stem}_sbi"
+            save_sample(sbi_dir, sbi_stem, sbi_face, lm)
+
+
+# ─────────────────────────────────────────────
 # 7. TF DATASET 빌더
 # ─────────────────────────────────────────────
 
@@ -567,6 +760,10 @@ def run_pipeline(dataset_keys: list = None):
         done_stems.add(existing.stem.replace("_lm", ""))
     log.info(f"기처리 샘플: {len(done_stems):,}개")
 
+    if done_stems:
+        sample_stem = next(iter(done_stems))
+        log.info(f"done_stems 예시: {sample_stem}")
+
     try:
         for ds_key in dataset_keys:
             root, parser_name = DATASETS[ds_key]
@@ -582,8 +779,51 @@ def run_pipeline(dataset_keys: list = None):
             for file_path, label in tqdm(samples, desc=f"[{ds_key}]"):
 
                 check_stem = f"{Path(file_path).stem}_f000"
+                already_processed = check_stem in done_stems
 
-                if check_stem in done_stems:  # ← 이 줄로
+                # real 샘플이고 SBI가 아직 없으면 SBI만 생성
+                if already_processed:
+                    if label == 0:  # real만 SBI 대상
+                        # SBI 샘플 존재 여부 별도 확인
+                        sbi_check = f"{check_stem}_sbi"
+                        if sbi_check in done_stems:
+                            continue  # SBI도 이미 있음 → 완전 스킵
+
+                        # SBI만 생성 (원본 재처리 없이)
+                        frames = extract_frames(
+                            file_path,
+                            interval=CFG["frame_interval"],
+                            max_frames=CFG["max_frames"],
+                        )
+                        for fi, frame in enumerate(frames):
+                            if frame is None:
+                                continue
+
+                            stem = f"{Path(file_path).stem}_f{fi:03d}"
+                            sbi_stem = f"{stem}_sbi"
+                            if sbi_stem in done_stems:
+                                continue
+
+                            # 기존 저장된 face/lm 로드 (재검출 불필요)
+                            out_dir = Path(CFG["output_root"]) / ds_key / "0"
+                            face_path = out_dir / f"{stem}_face.jpg"
+                            lm_path = out_dir / f"{stem}_lm.npy"
+
+                            if not face_path.exists() or not lm_path.exists():
+                                continue
+
+                            face_bgr = cv2.imread(str(face_path))
+                            lm = np.load(str(lm_path))
+
+                            sbi_face = generate_sbi(face_bgr, lm)
+                            if sbi_face is not None and np.random.rand() < 0.5:
+                                sbi_dir = Path(CFG["output_root"]) / ds_key / "1"
+                                save_sample(sbi_dir, sbi_stem, sbi_face, lm)
+                                total_saved += 1
+                                done_stems.add(stem)
+                                done_stems.add(f"{stem}_sbi")
+                    else:
+                        continue  # fake 샘플 → 스킵
                     continue
 
                 frames = extract_frames(
@@ -606,8 +846,15 @@ def run_pipeline(dataset_keys: list = None):
 
                     # 저장
                     stem    = f"{Path(file_path).stem}_f{fi:03d}"
-                    out_dir = out_root / ds_key / str(label)
-                    save_sample(out_dir, stem, face, lm)
+                    save_sample_with_sbi(
+                        out_root=Path(CFG["output_root"]),
+                        ds_key=ds_key,
+                        stem=stem,
+                        face_bgr=face,
+                        lm=lm,
+                        label=label,
+                        sbi_prob=0.5,  # real 샘플의 50%에 SBI 적용
+                    )
                     total_saved += 1
 
             # 랜드마크 실패율 경고
@@ -654,7 +901,7 @@ if __name__ == "__main__":
         )
 
     # ── 전처리 실행 ──────────────────────────────────────────────────────────
-    processed_root = run_pipeline(dataset_keys=["ffpp"])
+    processed_root = run_pipeline(dataset_keys=["celebdf","ffpp","hidf","redface"])
 
     # ── tf.data 검증 ─────────────────────────────────────────────────────────
     if not any(Path(processed_root).rglob("*_face.jpg")):
