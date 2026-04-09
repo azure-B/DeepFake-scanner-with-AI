@@ -1,0 +1,58 @@
+2026-04-07 13:49:58,146 [INFO] CLIP ViT-B/16 사용 가능
+2026-04-07 13:49:58,176 [INFO] GPU 1개 감지
+2026-04-07 13:49:58,176 [INFO] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA GeForce RTX 4060, compute capability 8.9
+2026-04-07 13:49:58,176 [INFO] compute dtype: float16
+2026-04-07 13:49:58,527 [INFO] ============================================================
+2026-04-07 13:49:58,528 [INFO] STEP 1: Train 데이터 수집
+2026-04-07 13:50:01,491 [INFO] [ffpp] real=40,844  fake=56,440
+2026-04-07 13:50:02,498 [INFO] [dff] real=8,054  fake=21,749
+2026-04-07 13:50:08,017 [INFO] [hidf] real=74,850  fake=120,318
+2026-04-07 13:50:08,065 [INFO] 전체: real=123,748  fake=198,507  total=322,255
+2026-04-07 13:50:08,066 [INFO] ============================================================
+2026-04-07 13:50:08,066 [INFO] STEP 2: 영상 ID 단위 분할
+2026-04-07 13:50:10,056 [INFO] [train] real=86,625  fake=138,984  total=225,609
+2026-04-07 13:50:10,064 [INFO] [val] real=12,164  fake=19,299  total=31,463
+2026-04-07 13:50:10,081 [INFO] [test] real=24,959  fake=40,224  total=65,183
+2026-04-07 13:50:10,085 [INFO] ============================================================
+2026-04-07 13:50:10,085 [INFO] STEP 3: 클래스 불균형 처리 (Undersample)
+2026-04-07 13:50:10,104 [INFO] 언더샘플: real=86,625  fake=86,625
+2026-04-07 13:50:10,112 [INFO] ============================================================
+2026-04-07 13:50:10,112 [INFO] STEP 4: External Test 데이터 수집
+2026-04-07 13:50:18,324 [INFO] [celebdf] real=26,391  fake=184,014
+2026-04-07 13:50:19,347 [INFO] [redface] real=7,411  fake=23,486
+2026-04-07 13:50:19,384 [INFO] 전체: real=33,802  fake=207,500  total=241,302
+2026-04-07 13:50:19,385 [INFO] ============================================================
+2026-04-07 13:50:19,385 [INFO] STEP 5: tf.data 파이프라인 빌드
+2026-04-07 13:50:20,962 [INFO] ============================================================
+2026-04-07 13:50:20,962 [INFO] STEP 6: 모델 빌드 (7-Head + Cross-Attention)
+2026-04-07 13:50:27,783 [INFO] Inner model params: 90,457,300
+2026-04-07 13:50:27,783 [INFO] ============================================================
+2026-04-07 13:50:27,784 [INFO] STEP 7: 컴파일
+2026-04-07 13:50:27,790 [INFO] steps/epoch=10,828  total=541,400  warmup=54,140
+2026-04-07 13:50:27,790 [INFO] 새 학습 시작
+2026-04-07 13:50:27,790 [INFO] ============================================================
+2026-04-07 13:50:27,790 [INFO] STEP 8: 학습 시작
+2026-04-07 15:22:39,361 [INFO] Epoch 1 log_vars | rgb=+0.175  wav=+0.176  lm=+0.176  rgb_wav=+0.175  rgb_lm=+0.175  wav_lm=+0.176  all=+0.175
+2026-04-07 15:22:39,364 [INFO] Epoch   1 │ loss=1.6641  auc=0.6335  val_loss=0.9123  val_auc=0.8527  lr=6.00e-05
+2026-04-07 16:51:53,447 [INFO] Epoch 2 log_vars | rgb=-0.790  wav=-0.787  lm=-0.787  rgb_wav=-0.790  rgb_lm=-0.790  wav_lm=-0.787  all=-0.790
+2026-04-07 16:51:53,448 [INFO] Epoch   2 │ loss=-0.4552  auc=0.7788  val_loss=-2.0450  val_auc=0.8775  lr=1.20e-04
+2026-04-07 18:21:15,559 [INFO] Epoch 3 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-07 18:21:15,560 [INFO] Epoch   3 │ loss=-3.8419  auc=0.7988  val_loss=-5.1815  val_auc=0.8939  lr=1.80e-04
+2026-04-07 19:50:39,839 [INFO] Epoch 4 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-07 19:50:39,840 [INFO] Epoch   4 │ loss=-4.9777  auc=0.8134  val_loss=-5.0649  val_auc=0.8941  lr=2.40e-04
+2026-04-07 21:20:10,521 [INFO] Epoch 5 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-07 21:20:10,522 [INFO] Epoch   5 │ loss=-5.0010  auc=0.8214  val_loss=-4.8582  val_auc=0.8810  lr=3.00e-04
+2026-04-07 22:50:02,010 [INFO] Epoch 6 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-07 22:50:02,011 [INFO] Epoch   6 │ loss=-5.0434  auc=0.8341  val_loss=-5.1885  val_auc=0.9042  lr=3.00e-04
+2026-04-08 00:20:28,442 [INFO] Epoch 7 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-08 00:20:28,443 [INFO] Epoch   7 │ loss=-5.0847  auc=0.8481  val_loss=-5.1102  val_auc=0.8997  lr=2.99e-04
+2026-04-08 01:50:41,667 [INFO] Epoch 8 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-08 01:50:41,668 [INFO] Epoch   8 │ loss=-5.1083  auc=0.8561  val_loss=-5.0572  val_auc=0.9061  lr=2.97e-04
+2026-04-08 01:50:41,735 [INFO] Epoch 8: backbone unfreeze | lr 2.97e-04 → 2.97e-06
+2026-04-08 03:20:57,062 [INFO] Epoch 9 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-08 03:20:57,063 [INFO] Epoch   9 │ loss=-5.1309  auc=0.8628  val_loss=-5.2599  val_auc=0.9062  lr=2.97e-06
+2026-04-08 04:50:59,335 [INFO] Epoch 10 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-08 04:50:59,335 [INFO] Epoch  10 │ loss=-5.1438  auc=0.8672  val_loss=-5.2115  val_auc=0.9090  lr=2.97e-06
+2026-04-08 06:21:31,625 [INFO] Epoch 11 log_vars | rgb=-2.000  wav=-2.000  lm=-2.000  rgb_wav=-2.000  rgb_lm=-2.000  wav_lm=-2.000  all=-2.000
+2026-04-08 06:21:31,625 [INFO] Epoch  11 │ loss=-5.1638  auc=0.8737  val_loss=-5.2350  val_auc=0.9085  lr=2.97e-06

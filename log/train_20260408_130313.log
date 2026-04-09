@@ -1,0 +1,9 @@
+2026-04-08 13:03:16,939 [INFO] CLIP ViT-B/16 사용 가능
+2026-04-08 13:03:16,980 [INFO] GPU 1개 감지
+2026-04-08 13:03:16,980 [INFO] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA GeForce RTX 4060, compute capability 8.9
+2026-04-08 13:03:16,980 [INFO] compute dtype: float16
+2026-04-08 13:03:17,353 [INFO] ============================================================
+2026-04-08 13:03:17,353 [INFO] STEP 1: Train 데이터 수집
+2026-04-08 13:03:20,752 [INFO] [ffpp] real=40,844  fake=56,440
+2026-04-08 13:03:21,790 [INFO] [dff] real=8,054  fake=21,749

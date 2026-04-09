@@ -1,0 +1,125 @@
+2026-04-08 14:51:43,449 [INFO] CLIP ViT-B/16 사용 가능
+2026-04-08 14:51:43,476 [INFO] GPU 1개 감지
+2026-04-08 14:51:43,476 [INFO] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA GeForce RTX 4060, compute capability 8.9
+2026-04-08 14:51:43,476 [INFO] compute dtype: float16
+2026-04-08 14:51:43,831 [INFO] ============================================================
+2026-04-08 14:51:43,831 [INFO] STEP 1: Train 데이터 수집
+2026-04-08 14:51:47,365 [INFO] [ffpp] real=40,844  fake=56,440
+2026-04-08 14:51:48,383 [INFO] [dff] real=8,054  fake=21,749
+2026-04-08 14:51:54,985 [INFO] [hidf] real=74,850  fake=120,318
+2026-04-08 14:51:55,033 [INFO] 전체: real=123,748  fake=198,507  total=322,255
+2026-04-08 14:51:55,034 [INFO] ============================================================
+2026-04-08 14:51:55,034 [INFO] STEP 2: 영상 ID 단위 분할
+2026-04-08 14:51:58,587 [INFO] [train] real=86,625  fake=138,984  total=225,609
+2026-04-08 14:51:58,602 [INFO] [val] real=12,164  fake=19,299  total=31,463
+2026-04-08 14:51:58,630 [INFO] [test] real=24,959  fake=40,224  total=65,183
+2026-04-08 14:51:58,636 [INFO] ============================================================
+2026-04-08 14:51:58,637 [INFO] STEP 3: 클래스 불균형 처리 (Undersample)
+2026-04-08 14:51:58,657 [INFO] 언더샘플: real=86,625  fake=86,625
+2026-04-08 14:51:58,665 [INFO] ============================================================
+2026-04-08 14:51:58,666 [INFO] STEP 4: External Test 데이터 수집
+2026-04-08 14:52:07,686 [INFO] [celebdf] real=26,391  fake=184,454
+2026-04-08 14:52:08,848 [INFO] [redface] real=7,411  fake=23,486
+2026-04-08 14:52:08,885 [INFO] 전체: real=33,802  fake=207,940  total=241,742
+2026-04-08 14:52:08,885 [INFO] ============================================================
+2026-04-08 14:52:08,885 [INFO] STEP 5: tf.data 파이프라인 빌드
+2026-04-08 14:52:10,491 [INFO] ============================================================
+2026-04-08 14:52:10,491 [INFO] STEP 6: 모델 빌드 (7-Head + Cross-Attention)
+2026-04-08 14:52:19,419 [INFO] Inner model params: 90,415,188
+2026-04-08 14:52:19,419 [INFO] ============================================================
+2026-04-08 14:52:19,419 [INFO] STEP 7: 컴파일
+2026-04-08 14:52:19,425 [INFO] steps/epoch=10,828  total=541,400  warmup=54,140
+2026-04-08 14:52:19,425 [INFO] 새 학습 시작
+2026-04-08 14:52:19,425 [INFO] ============================================================
+2026-04-08 14:52:19,425 [INFO] STEP 8: 학습 시작
+2026-04-08 15:17:47,793 [INFO] Epoch 1 head_weights | rgb=0.563  wav=0.715  lm=1.870  rgb_wav=0.962  rgb_lm=1.286  wav_lm=1.173  all=0.431
+2026-04-08 15:17:47,797 [INFO] Epoch   1 │ loss=0.7534  auc=0.6324  val_loss=0.6107  val_auc=0.8581  lr=6.00e-05
+2026-04-08 15:43:01,008 [INFO] Epoch 2 head_weights | rgb=0.851  wav=0.304  lm=0.791  rgb_wav=1.622  rgb_lm=2.211  wav_lm=0.497  all=0.724
+2026-04-08 15:43:01,009 [INFO] Epoch   2 │ loss=0.6131  auc=0.7772  val_loss=0.6156  val_auc=0.8723  lr=1.20e-04
+2026-04-08 16:08:35,280 [INFO] Epoch 3 head_weights | rgb=0.809  wav=0.058  lm=0.151  rgb_wav=1.972  rgb_lm=3.062  wav_lm=0.095  all=0.854
+2026-04-08 16:08:35,281 [INFO] Epoch   3 │ loss=0.5684  auc=0.7988  val_loss=0.4623  val_auc=0.8909  lr=1.80e-04
+2026-04-08 16:34:51,789 [INFO] Epoch 4 head_weights | rgb=0.636  wav=0.009  lm=0.024  rgb_wav=1.690  rgb_lm=3.824  wav_lm=0.015  all=0.802
+2026-04-08 16:34:51,790 [INFO] Epoch   4 │ loss=0.5464  auc=0.8110  val_loss=0.5151  val_auc=0.8953  lr=2.40e-04
+2026-04-08 17:01:14,069 [INFO] Epoch 5 head_weights | rgb=0.594  wav=0.001  lm=0.003  rgb_wav=1.304  rgb_lm=4.300  wav_lm=0.002  all=0.796
+2026-04-08 17:01:14,070 [INFO] Epoch   5 │ loss=0.5373  auc=0.8186  val_loss=0.5810  val_auc=0.8897  lr=3.00e-04
+2026-04-08 17:27:29,314 [INFO] Epoch 6 head_weights | rgb=0.539  wav=0.000  lm=0.000  rgb_wav=1.007  rgb_lm=4.564  wav_lm=0.000  all=0.889
+2026-04-08 17:27:29,315 [INFO] Epoch   6 │ loss=0.5278  auc=0.8283  val_loss=0.4563  val_auc=0.9010  lr=3.00e-04
+2026-04-08 17:53:50,527 [INFO] Epoch 7 head_weights | rgb=0.466  wav=0.000  lm=0.000  rgb_wav=0.759  rgb_lm=4.814  wav_lm=0.000  all=0.961
+2026-04-08 17:53:50,528 [INFO] Epoch   7 │ loss=0.5163  auc=0.8386  val_loss=0.5035  val_auc=0.9053  lr=2.99e-04
+2026-04-08 18:20:14,862 [INFO] Epoch 8 head_weights | rgb=0.388  wav=0.000  lm=0.000  rgb_wav=0.579  rgb_lm=4.897  wav_lm=0.000  all=1.136
+2026-04-08 18:20:14,863 [INFO] Epoch   8 │ loss=0.5096  auc=0.8448  val_loss=0.4847  val_auc=0.8989  lr=2.97e-04
+2026-04-08 18:20:14,912 [INFO] Epoch 8: backbone unfreeze | lr 2.97e-04 → 2.97e-06
+2026-04-08 18:46:28,046 [INFO] Epoch 9 head_weights | rgb=0.287  wav=0.000  lm=0.000  rgb_wav=0.406  rgb_lm=4.923  wav_lm=0.000  all=1.384
+2026-04-08 18:46:28,046 [INFO] Epoch   9 │ loss=0.5046  auc=0.8489  val_loss=0.4596  val_auc=0.9065  lr=2.97e-06
+2026-04-08 19:12:52,829 [INFO] Epoch 10 head_weights | rgb=0.197  wav=0.000  lm=0.000  rgb_wav=0.284  rgb_lm=4.960  wav_lm=0.000  all=1.559
+2026-04-08 19:12:52,829 [INFO] Epoch  10 │ loss=0.4991  auc=0.8535  val_loss=0.4604  val_auc=0.9030  lr=2.97e-06
+2026-04-08 19:39:05,305 [INFO] Epoch 11 head_weights | rgb=0.138  wav=0.000  lm=0.000  rgb_wav=0.198  rgb_lm=4.905  wav_lm=0.000  all=1.759
+2026-04-08 19:39:05,305 [INFO] Epoch  11 │ loss=0.4951  auc=0.8575  val_loss=0.4824  val_auc=0.9001  lr=2.97e-06
+2026-04-08 20:05:19,748 [INFO] Epoch 12 head_weights | rgb=0.091  wav=0.000  lm=0.000  rgb_wav=0.138  rgb_lm=4.808  wav_lm=0.000  all=1.963
+2026-04-08 20:05:19,748 [INFO] Epoch  12 │ loss=0.4921  auc=0.8592  val_loss=0.4394  val_auc=0.9030  lr=2.97e-06
+2026-04-08 20:31:31,646 [INFO] Epoch 13 head_weights | rgb=0.061  wav=0.000  lm=0.000  rgb_wav=0.100  rgb_lm=4.461  wav_lm=0.000  all=2.379
+2026-04-08 20:31:31,646 [INFO] Epoch  13 │ loss=0.4875  auc=0.8632  val_loss=0.5081  val_auc=0.8968  lr=2.97e-06
+2026-04-08 20:57:51,082 [INFO] Epoch 14 head_weights | rgb=0.037  wav=0.000  lm=0.000  rgb_wav=0.067  rgb_lm=4.181  wav_lm=0.000  all=2.716
+2026-04-08 20:57:51,082 [INFO] Epoch  14 │ loss=0.4836  auc=0.8659  val_loss=0.4827  val_auc=0.8971  lr=2.97e-06
+2026-04-08 21:24:11,783 [INFO] Epoch 15 head_weights | rgb=0.023  wav=0.000  lm=0.000  rgb_wav=0.043  rgb_lm=3.753  wav_lm=0.000  all=3.181
+2026-04-08 21:24:11,783 [INFO] Epoch  15 │ loss=0.4804  auc=0.8685  val_loss=0.4654  val_auc=0.8976  lr=2.97e-06
+2026-04-08 21:50:28,010 [INFO] Epoch 16 head_weights | rgb=0.014  wav=0.000  lm=0.000  rgb_wav=0.029  rgb_lm=3.339  wav_lm=0.000  all=3.618
+2026-04-08 21:50:28,010 [INFO] Epoch  16 │ loss=0.4765  auc=0.8715  val_loss=0.4807  val_auc=0.8959  lr=2.97e-06
+2026-04-08 22:17:08,227 [INFO] Epoch 17 head_weights | rgb=0.008  wav=0.000  lm=0.000  rgb_wav=0.019  rgb_lm=2.941  wav_lm=0.000  all=4.032
+2026-04-08 22:17:08,227 [INFO] Epoch  17 │ loss=0.4737  auc=0.8734  val_loss=0.4684  val_auc=0.8981  lr=2.97e-06
+2026-04-08 22:43:29,833 [INFO] Epoch 18 head_weights | rgb=0.004  wav=0.000  lm=0.000  rgb_wav=0.012  rgb_lm=2.409  wav_lm=0.000  all=4.575
+2026-04-08 22:43:29,833 [INFO] Epoch  18 │ loss=0.4731  auc=0.8744  val_loss=0.5063  val_auc=0.8905  lr=2.97e-06
+2026-04-08 23:09:52,460 [INFO] Epoch 19 head_weights | rgb=0.002  wav=0.000  lm=0.000  rgb_wav=0.007  rgb_lm=1.987  wav_lm=0.000  all=5.003
+2026-04-08 23:09:52,460 [INFO] Epoch  19 │ loss=0.4702  auc=0.8765  val_loss=0.4908  val_auc=0.8870  lr=2.97e-06
+2026-04-08 23:36:18,489 [INFO] Epoch 20 head_weights | rgb=0.001  wav=0.000  lm=0.000  rgb_wav=0.004  rgb_lm=1.614  wav_lm=0.000  all=5.380
+2026-04-08 23:36:18,489 [INFO] Epoch  20 │ loss=0.4692  auc=0.8769  val_loss=0.4741  val_auc=0.8906  lr=2.97e-06
+2026-04-09 00:02:39,073 [INFO] Epoch 21 head_weights | rgb=0.001  wav=0.000  lm=0.000  rgb_wav=0.002  rgb_lm=1.149  wav_lm=0.000  all=5.848
+2026-04-09 00:02:39,073 [INFO] Epoch  21 │ loss=0.4641  auc=0.8802  val_loss=0.4590  val_auc=0.8975  lr=2.97e-06
+2026-04-09 00:28:59,723 [INFO] Epoch 22 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.001  rgb_lm=0.781  wav_lm=0.000  all=6.217
+2026-04-09 00:28:59,723 [INFO] Epoch  22 │ loss=0.4609  auc=0.8825  val_loss=0.4387  val_auc=0.8959  lr=2.97e-06
+2026-04-09 00:55:22,594 [INFO] Epoch 23 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.001  rgb_lm=0.530  wav_lm=0.000  all=6.469
+2026-04-09 00:55:22,594 [INFO] Epoch  23 │ loss=0.4607  auc=0.8828  val_loss=0.5192  val_auc=0.8968  lr=2.97e-06
+2026-04-09 01:21:45,544 [INFO] Epoch 24 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.313  wav_lm=0.000  all=6.687
+2026-04-09 01:21:45,544 [INFO] Epoch  24 │ loss=0.4583  auc=0.8840  val_loss=0.4819  val_auc=0.8988  lr=2.97e-06
+2026-04-09 01:48:10,521 [INFO] Epoch 25 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.191  wav_lm=0.000  all=6.809
+2026-04-09 01:48:10,521 [INFO] Epoch  25 │ loss=0.4547  auc=0.8866  val_loss=0.4816  val_auc=0.8935  lr=2.97e-06
+2026-04-09 02:14:34,499 [INFO] Epoch 26 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.114  wav_lm=0.000  all=6.886
+2026-04-09 02:14:34,499 [INFO] Epoch  26 │ loss=0.4516  auc=0.8882  val_loss=0.4690  val_auc=0.9010  lr=2.97e-06
+2026-04-09 02:40:55,475 [INFO] Epoch 27 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.069  wav_lm=0.000  all=6.931
+2026-04-09 02:40:55,475 [INFO] Epoch  27 │ loss=0.4487  auc=0.8907  val_loss=0.4792  val_auc=0.8902  lr=2.97e-06
+2026-04-09 03:07:14,852 [INFO] Epoch 28 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.042  wav_lm=0.000  all=6.958
+2026-04-09 03:07:14,852 [INFO] Epoch  28 │ loss=0.4470  auc=0.8913  val_loss=0.5084  val_auc=0.8923  lr=2.97e-06
+2026-04-09 03:33:39,347 [INFO] Epoch 29 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.026  wav_lm=0.000  all=6.974
+2026-04-09 03:33:39,347 [INFO] Epoch  29 │ loss=0.4463  auc=0.8918  val_loss=0.4973  val_auc=0.8899  lr=2.97e-06
+2026-04-09 04:00:03,429 [INFO] Epoch 30 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.017  wav_lm=0.000  all=6.983
+2026-04-09 04:00:03,429 [INFO] Epoch  30 │ loss=0.4431  auc=0.8940  val_loss=0.4982  val_auc=0.8929  lr=2.97e-06
+2026-04-09 04:26:25,839 [INFO] Epoch 31 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.010  wav_lm=0.000  all=6.990
+2026-04-09 04:26:25,839 [INFO] Epoch  31 │ loss=0.4410  auc=0.8952  val_loss=0.4894  val_auc=0.8908  lr=2.97e-06
+2026-04-09 04:52:52,664 [INFO] Epoch 32 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.007  wav_lm=0.000  all=6.993
+2026-04-09 04:52:52,664 [INFO] Epoch  32 │ loss=nan  auc=0.8963  val_loss=nan  val_auc=0.8918  lr=2.97e-06
+2026-04-09 05:16:16,993 [INFO] Epoch 33 head_weights | rgb=0.000  wav=0.000  lm=0.000  rgb_wav=0.000  rgb_lm=0.005  wav_lm=0.000  all=6.995
+2026-04-09 05:16:16,994 [INFO] Epoch  33 │ loss=nan  auc=0.8971  val_loss=nan  val_auc=0.8911  lr=2.97e-06
+2026-04-09 05:39:54,405 [INFO] Epoch 34 head_weights | rgb=0.287  wav=0.000  lm=0.000  rgb_wav=0.406  rgb_lm=4.923  wav_lm=0.000  all=1.384
+2026-04-09 05:39:54,405 [INFO] Epoch  34 │ loss=nan  auc=0.8990  val_loss=nan  val_auc=0.8874  lr=2.97e-06
+2026-04-09 05:39:54,418 [INFO] 학습 완료 — 14.79h
+2026-04-09 05:39:54,418 [INFO] ============================================================
+2026-04-09 05:39:54,418 [INFO] STEP 9: 최종 평가
+2026-04-09 07:19:11,123 [INFO] 
+==============================================================
+2026-04-09 07:19:11,123 [INFO]   [Internal (FF++/DFF/HIDF)]  Ablation Table  (TTA x8)
+2026-04-09 07:19:11,123 [INFO] ==============================================================
+2026-04-09 07:19:11,123 [INFO]   Head             AUC      F1     ACC    Thr
+2026-04-09 07:19:11,123 [INFO]   ----------------------------------------------
+2026-04-09 07:19:11,146 [INFO]   rgb           0.8977  0.8579  0.8111  0.35
+2026-04-09 07:19:11,155 [INFO]   wav           0.5000  0.7632  0.6171  0.10
+2026-04-09 07:19:11,164 [INFO]   lm            0.5195  0.7632  0.6171  0.10
+2026-04-09 07:19:11,174 [INFO]   rgb_wav       0.8972  0.8568  0.8073  0.35
+2026-04-09 07:19:11,182 [INFO]   rgb_lm        0.8987  0.8580  0.8175  0.40
+2026-04-09 07:19:11,192 [INFO]   wav_lm        0.5206  0.7632  0.6171  0.10
+2026-04-09 07:19:11,200 [INFO]   all           0.8992  0.8566  0.8189  0.40  ★ MAIN
+2026-04-09 07:19:11,211 [INFO]   aux_lf        0.5000  0.7632  0.6171  0.10  (aux)
+2026-04-09 07:19:11,219 [INFO]   aux_hf        0.5000  0.7632  0.6171  0.10  (aux)
+2026-04-09 07:19:11,219 [INFO] ==============================================================
+2026-04-09 07:19:19,815 [INFO] [celebdf] real=26,391  fake=184,454
+2026-04-09 07:19:19,849 [INFO] 전체: real=26,391  fake=184,454  total=210,845

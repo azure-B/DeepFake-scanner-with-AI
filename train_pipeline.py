@@ -382,13 +382,25 @@ def _decompose_wavelet_np(img_np: np.ndarray) -> np.ndarray:
 
 
 def _load_wavelet(img_path_tensor, flip: bool = False) -> np.ndarray:
-    """tf.py_function 래퍼 — 이미지 경로 → 웨이블릿 서브밴드"""
-    path = img_path_tensor.numpy().decode()
-    img  = tf.image.decode_jpeg(tf.io.read_file(path), channels=3)
-    img  = tf.cast(img, tf.float32) / 255.0
+    """
+    사전 계산된 _wav.npy 로드.
+    없으면 실시간 계산 fallback (하위 호환).
+    """
+    path      = img_path_tensor.numpy().decode()
+    wav_path  = path.replace("_face.jpg", "_wav.npy")
+
+    if os.path.exists(wav_path):
+        wav = np.load(wav_path).astype(np.float32)   # (10,14,14,3) 즉시 로드
+    else:
+        # fallback: 실시간 계산
+        img = tf.image.decode_jpeg(tf.io.read_file(path), channels=3)
+        img = tf.cast(img, tf.float32) / 255.0
+        wav = _decompose_wavelet_np(img.numpy())
+
     if flip:
-        img = tf.image.flip_left_right(img)
-    return _decompose_wavelet_np(img.numpy())
+        wav = wav[:, :, ::-1, :]   # width 축 반전 (numpy)
+
+    return wav
 
 def augment_face_no_flip(face: tf.Tensor) -> tf.Tensor:
     face = tf.image.random_brightness(face, max_delta=0.2)
@@ -662,12 +674,21 @@ def build_wsv_branch(
           메인 임베딩 + 저주파 aux + 고주파 aux
           (aux 출력 유지로 aux_lf / aux_hf 헤드와 호환)
     """
-    patch_dim = 14 * 14 * 3    # 588
 
     inp = keras.Input(shape=(n_bands, 14, 14, 3), name="wav")
 
-    # 1. Flatten: (B, 10, 588)
-    x = layers.Reshape((n_bands, patch_dim), name="wav_flat")(inp)
+    x = layers.TimeDistributed(
+        layers.Conv2D(64, kernel_size=3, padding="same", activation="gelu")
+    )(inp)
+
+    # (B, 10, 14, 14, 64) -> (B, 10, 7, 7, 128) -> MaxPool로 압축
+    x = layers.TimeDistributed(
+        layers.Conv2D(128, kernel_size=3, strides=2, padding="same", activation="gelu")
+    )(x)
+
+    # 이제 안전하게 GlobalAveragePooling2D로 각 밴드별 1D 벡터 생성
+    # (B, 10, 128)
+    x = layers.TimeDistributed(layers.GlobalAveragePooling2D())(x)
 
     # 2. Linear 임베딩
     x = layers.TimeDistributed(
@@ -876,37 +897,59 @@ def build_head(feat, name, hidden, dropout, reg):
 # 6. Uncertainty Weights Layer
 # ═══════════════════════════════════════════════════════════════
 
+# ── UncertaintyWeights: get_log_var 제거, get_normalized_weights만 유지 ──
 class UncertaintyWeights(keras.layers.Layer):
-    """
-    Kendall & Gal (2017) Homoscedastic Uncertainty
-    각 헤드별 학습 가능한 log(σ²) 파라미터 7개
-    → 약한 브랜치는 σ가 커져 자동으로 loss 기여 감소
-    → add_weight()로 생성 → trainable_variables에 자동 등록
-    """
     def __init__(self, head_names, **kwargs):
         super().__init__(name="uncertainty_weights", **kwargs)
         self.head_names = head_names
-        self.log_vars   = {
+
+        self.raw_weights = {
             name: self.add_weight(
-                name=f"log_var_{name}",
-                shape=(),
-                initializer=keras.initializers.Constant(0.5),
-                trainable=True,
-                dtype=tf.float32,
+                name=f"raw_w_{name}", shape=(),
+                initializer=keras.initializers.Constant(0.0),
+                trainable=True, dtype=tf.float32,
             )
             for name in head_names
         }
 
-    def call(self, inputs):
-        return inputs   # 통과만 함 (가중치 보관 목적)
+    def get_normalized_weights(self):
+        raw = tf.stack([self.raw_weights[n] for n in self.head_names])
+        weights = tf.nn.sigmoid(raw) + 0.1
+        return {n: weights[i] for i, n in enumerate(self.head_names)}
 
-    def get_log_var(self, name):
-        return tf.clip_by_value(self.log_vars[name], -2.0, 2.0)
+    def call(self, inputs):
+        return inputs
 
     def get_config(self):
         cfg = super().get_config()
         cfg["head_names"] = self.head_names
         return cfg
+
+
+# ── _uncertainty_loss: softmax 가중치 사용으로 통일 ──
+def _uncertainty_loss(self, y_true, y_pred_dict):
+    total = tf.constant(0.0, dtype=tf.float32)
+    weights = self.uw_layer.get_normalized_weights()
+
+    for name in HEAD_NAMES:
+        fl = self._focal(y_true, y_pred_dict[name])
+        total += weights[name] * fl
+
+    for name in AUX_HEAD_NAMES:
+        total += self.aux_weight * self._focal(y_true, y_pred_dict[name])
+
+    return total
+
+
+# ── LogUncertaintyCallback: raw_weights 값 출력으로 변경 ──
+class LogUncertaintyCallback(keras.callbacks.Callback):
+    def on_epoch_end(self, epoch, logs=None):
+        w = self.model.uw_layer.get_normalized_weights()
+        log.info(
+            f"Epoch {epoch+1} head_weights | "
+            + "  ".join(f"{k}={float(v):.3f}" for k, v in w.items())
+        )
+
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1029,14 +1072,12 @@ class DeepfakeDetector(keras.Model):
 
     def _uncertainty_loss(self, y_true, y_pred_dict):
         total = tf.constant(0.0, dtype=tf.float32)
+        weights = self.uw_layer.get_normalized_weights()
 
-        # 메인 7 헤드: 불확실성 가중
         for name in HEAD_NAMES:
-            l_i   = self._focal(y_true, y_pred_dict[name])
-            lv    = self.uw_layer.get_log_var(name)
-            total += 0.5 * (tf.exp(-lv) * l_i + lv)
+            fl = self._focal(y_true, y_pred_dict[name])
+            total += weights[name] * fl
 
-        # Auxiliary 헤드: 고정 가중치
         for name in AUX_HEAD_NAMES:
             total += self.aux_weight * self._focal(y_true, y_pred_dict[name])
 
@@ -1131,28 +1172,45 @@ def parse_best_auc_from_ckpt(ckpt_path: str) -> float:
     m = re.search(r"valauc([\d.]+?)(?=\.index|$)", ckpt_path)
     return float(m.group(1)) if m else None
 
+
 def _unfreeze_all(m):
-    """재귀적으로 모든 레이어 unfreeze (CLIP 포함)"""
+    """CLIP의 최상단 2개 블록(10, 11)과 LayerNorm만 점진적 Unfreeze"""
     m.trainable = True
     for layer in getattr(m, "layers", []):
-        layer.trainable = True
         if hasattr(layer, "clip"):
-            layer.clip.trainable = True
-        _unfreeze_all(layer)
+            for clip_sublayer in layer.clip.layers:
+                if "encoder" in clip_sublayer.name:
+                    for block in clip_sublayer.layers:  # Transformer Blocks
+                        if "layers" in block.name:
+                            for i, tf_layer in enumerate(block.layers):
+                                tf_layer.trainable = (i >= 10)
+
+                elif "post_layernorm" in clip_sublayer.name or "visual_projection" in clip_sublayer.name:
+                    clip_sublayer.trainable = True
+
+                else:
+                    clip_sublayer.trainable = False
+            layer.trainable = True
+        else:
+            layer.trainable = True
+
 
 
 class BackboneUnfreezeCallback(keras.callbacks.Callback):
-    def __init__(self, unfreeze_epoch: int, lr_scale: float = 0.01):
+    def __init__(self, unfreeze_epoch, lr_scale=0.01, steps_per_epoch=None,
+                 total_epochs=None, lr_min=1e-7):
         super().__init__()
-        self.unfreeze_epoch = unfreeze_epoch
-        self.lr_scale       = lr_scale
-        self._unfrozen      = False
+        self.unfreeze_epoch  = unfreeze_epoch
+        self.lr_scale        = lr_scale
+        self.steps_per_epoch = steps_per_epoch  # ← 추가
+        self.total_epochs    = total_epochs      # ← 추가
+        self.lr_min          = lr_min            # ← 추가
+        self._unfrozen       = False
 
     def on_epoch_begin(self, epoch, logs=None):
         if epoch == self.unfreeze_epoch and not self._unfrozen:
             _unfreeze_all(self.model)
 
-            # LossScaleOptimizer 대응
             opt = self.model.optimizer
             inner_opt = opt.inner_optimizer if hasattr(opt, "inner_optimizer") else opt
 
@@ -1160,25 +1218,19 @@ class BackboneUnfreezeCallback(keras.callbacks.Callback):
                                if callable(inner_opt.learning_rate)
                                else inner_opt.learning_rate)
             new_lr = current_lr * self.lr_scale
-            inner_opt.learning_rate = new_lr
+
+            # ← float 고정값 대신 새 schedule 객체 생성
+            remaining_epochs = self.total_epochs - epoch
+            inner_opt.learning_rate = WarmupCosineDecay(
+                lr_init      = new_lr,
+                lr_min       = self.lr_min,
+                warmup_steps = self.steps_per_epoch * 2,
+                total_steps  = self.steps_per_epoch * remaining_epochs,
+            )
 
             self._unfrozen = True
             log.info(f"Epoch {epoch}: backbone unfreeze | "
-                     f"lr {current_lr:.2e} → {new_lr:.2e}")
-
-
-class LogUncertaintyCallback(keras.callbacks.Callback):
-    """에폭 끝마다 각 헤드의 log_var(불확실성) 출력"""
-    def on_epoch_end(self, epoch, logs=None):
-        lv = {
-            name: float(self.model.uw_layer.get_log_var(name).numpy())
-            for name in HEAD_NAMES
-        }
-        log.info(
-            f"Epoch {epoch+1} log_vars | "
-            + "  ".join(f"{k}={v:+.3f}" for k, v in lv.items())
-        )
-
+                     f"lr {current_lr:.2e} → {new_lr:.2e} ")
 
 def _get_lr(model):
     opt = model.optimizer
@@ -1236,7 +1288,8 @@ def build_callbacks(cfg: dict, model, initial_best_auc=None) -> list:
 # 11. 평가 — Ablation Table 자동 생성
 # ═══════════════════════════════════════════════════════════════
 
-HEAD_NAMES     = ["rgb", "wav", "lm", "rgb_wav", "rgb_lm", "wav_lm", "all"]
+# 수정
+HEAD_NAMES = ["rgb", "wav", "lm", "rgb_wav", "rgb_lm", "wav_lm", "all"]
 AUX_HEAD_NAMES = ["aux_lf", "aux_hf"]
 ALL_EVAL_HEADS = HEAD_NAMES + AUX_HEAD_NAMES
 
@@ -1253,8 +1306,8 @@ def evaluate_model(model: DeepfakeDetector, test_ds, tag="Test", n_tta=8):
             aug_face  = tf.image.flip_left_right(inputs["face"]) \
                         if do_flip else inputs["face"]
             aug_inputs = {"face": aug_face,
-                          "dct" : inputs["dct"],
-                          "lm"  : inputs["lm"]}
+                          "wav": inputs["wav"],  # ← 수정
+                          "lm": inputs["lm"]}
 
             out = model(aug_inputs, training=False)
             for name in ALL_EVAL_HEADS:
@@ -1392,7 +1445,7 @@ def main():
             int(warmup_steps), int(total_steps),
         )
 
-    base_optimizer = keras.optimizers.Adam(learning_rate=schedule, clipnorm=1.0)
+    base_optimizer = keras.optimizers.Adam(learning_rate=schedule, clipnorm=0.5)  # 1.0 → 0.5
     optimizer = keras.mixed_precision.LossScaleOptimizer(base_optimizer)
     model.compile(optimizer=optimizer)
 

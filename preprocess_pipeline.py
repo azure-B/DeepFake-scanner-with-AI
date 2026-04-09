@@ -29,6 +29,7 @@ import json
 import logging
 import numpy as np
 from pathlib import Path
+import pywt
 
 # ── MediaPipe (CPU 전용, TF 이전에 import해도 무방) ──────────────────────────
 import mediapipe as mp
@@ -273,6 +274,45 @@ PARSERS = {
 # 2. FRAME EXTRACTOR
 # ─────────────────────────────────────────────
 
+def _decompose_wavelet_np(img_np):
+    N_BANDS = 10
+    result  = []
+    import tensorflow as tf
+    for band_idx in range(N_BANDS):
+        ch_list = []
+        for c in range(3):
+            ch = img_np[:, :, c]
+            LL,  (LH1,HL1,HH1) = pywt.dwt2(ch,  "haar")
+            LL2, (LH2,HL2,HH2) = pywt.dwt2(LL,  "haar")
+            LL3, (LH3,HL3,HH3) = pywt.dwt2(LL2, "haar")
+            bands = [LL3,LH3,HL3,HH3,LH2,HL2,HH2,LH1,HL1,HH1]
+            b     = bands[band_idx].astype(np.float32)
+            b_t   = tf.image.resize(b[...,None],[14,14],method="bilinear")
+            b_n   = tf.squeeze(b_t,-1).numpy()
+            mn,mx = b_n.min(), b_n.max()
+            ch_list.append((b_n - mn) / (mx - mn + 1e-8))
+        result.append(np.stack(ch_list, axis=-1))
+    return np.stack(result, axis=0)
+
+root = Path("./processed")
+face_files = list(root.rglob("*_face.jpg"))
+print(f"총 {len(face_files):,}개 처리 시작")
+
+skip = 0
+for fp in tqdm(face_files):
+    wav_path = Path(str(fp).replace("_face.jpg", "_wav.npy"))
+    if wav_path.exists():
+        skip += 1
+        continue
+    img = cv2.imread(str(fp))
+    if img is None:
+        continue
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    wav = _decompose_wavelet_np(img_rgb)
+    np.save(str(wav_path), wav.astype(np.float32))
+
+print(f"완료 (스킵: {skip:,}개)")
+
 def extract_frames(video_path: str, interval: int, max_frames: int) -> list:
     """
     이미지 파일이면 그대로 반환, 영상이면 interval마다 프레임 추출.
@@ -469,12 +509,16 @@ class LandmarkExtractor:
 # 6. SAVE UTILS
 # ─────────────────────────────────────────────
 
-def save_sample(out_dir: Path, stem: str, face: np.ndarray,
-                lm: np.ndarray):
+def save_sample(out_dir: Path, stem: str, face: np.ndarray, lm: np.ndarray):
     out_dir.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(out_dir / f"{stem}_face.jpg"), face,
                 [cv2.IMWRITE_JPEG_QUALITY, 95])
-    np.save(str(out_dir / f"{stem}_lm.npy"),  lm)
+    np.save(str(out_dir / f"{stem}_lm.npy"), lm)
+
+    # ← 추가: 웨이블릿 사전 계산 저장
+    img_rgb = cv2.cvtColor(face, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    wav     = _decompose_wavelet_np(img_rgb)           # (10, 14, 14, 3)
+    np.save(str(out_dir / f"{stem}_wav.npy"), wav)
 
 
 # ─────────────────────────────────────────────
@@ -484,6 +528,7 @@ def save_sample(out_dir: Path, stem: str, face: np.ndarray,
 def _get_face_mask(lm: np.ndarray, img_size: int = 224) -> np.ndarray:
     """랜드마크 convex hull 기반 얼굴 마스크 생성"""
     mask = np.zeros((img_size, img_size), dtype=np.float32)
+    lm_clipped = np.clip(lm, 0, img_size - 1).astype(np.int32)
     hull = cv2.convexHull(lm.astype(np.int32))
     cv2.fillConvexPoly(mask, hull, 1.0)
 
@@ -598,25 +643,19 @@ def generate_sbi(face_bgr: np.ndarray,
 def save_sample_with_sbi(out_root: Path, ds_key: str,
                          stem: str, face_bgr: np.ndarray,
                          lm: np.ndarray, label: int,
-                         sbi_prob: float = 0.5):
-    """
-    원본 샘플 저장 + real 샘플이면 SBI fake 샘플도 생성
-
-    sbi_prob : real 샘플 1개당 SBI 샘플 생성 확률
-               (데이터셋 크기 조절용, 기본 50%)
-    """
-    # 원본 저장
+                         sbi_prob: float = 0.5) -> bool:
+    """반환값: SBI 저장 여부 (True/False)"""
     out_dir = out_root / ds_key / str(label)
     save_sample(out_dir, stem, face_bgr, lm)
 
-    # real 샘플에만 SBI 적용
     if label == 0 and np.random.rand() < sbi_prob:
         sbi_face = generate_sbi(face_bgr, lm)
         if sbi_face is not None:
-            sbi_dir = out_root / ds_key / "1"  # label=1 (fake)
+            sbi_dir  = out_root / ds_key / "1"
             sbi_stem = f"{stem}_sbi"
             save_sample(sbi_dir, sbi_stem, sbi_face, lm)
-
+            return True
+    return False
 
 # ─────────────────────────────────────────────
 # 7. TF DATASET 빌더
@@ -778,8 +817,9 @@ def run_pipeline(dataset_keys: list = None):
 
             for file_path, label in tqdm(samples, desc=f"[{ds_key}]"):
 
-                check_stem = f"{Path(file_path).stem}_f000"
-                already_processed = check_stem in done_stems
+                check_stem = Path(file_path).stem
+                # done_stems에 하나라도 file_stem_f... 형태가 있으면 이미 처리된 것으로 간주
+                already_processed = any(s.startswith(f"{check_stem}_f") for s in done_stems)
 
                 # real 샘플이고 SBI가 아직 없으면 SBI만 생성
                 if already_processed:
@@ -820,8 +860,7 @@ def run_pipeline(dataset_keys: list = None):
                                 sbi_dir = Path(CFG["output_root"]) / ds_key / "1"
                                 save_sample(sbi_dir, sbi_stem, sbi_face, lm)
                                 total_saved += 1
-                                done_stems.add(stem)
-                                done_stems.add(f"{stem}_sbi")
+                                done_stems.add(sbi_stem)
                     else:
                         continue  # fake 샘플 → 스킵
                     continue
@@ -846,16 +885,20 @@ def run_pipeline(dataset_keys: list = None):
 
                     # 저장
                     stem    = f"{Path(file_path).stem}_f{fi:03d}"
-                    save_sample_with_sbi(
-                        out_root=Path(CFG["output_root"]),
+
+                    sbi_saved = save_sample_with_sbi(  # ← 버그 2 수정
+                        out_root=out_root,
                         ds_key=ds_key,
                         stem=stem,
                         face_bgr=face,
                         lm=lm,
                         label=label,
-                        sbi_prob=0.5,  # real 샘플의 50%에 SBI 적용
+                        sbi_prob=0.5,
                     )
                     total_saved += 1
+                    done_stems.add(stem)  # ← 버그 1 수정
+                    if sbi_saved:
+                        done_stems.add(f"{stem}_sbi")
 
             # 랜드마크 실패율 경고
             if extractor.fail_rate > CFG["lm_fail_limit"]:
@@ -901,7 +944,7 @@ if __name__ == "__main__":
         )
 
     # ── 전처리 실행 ──────────────────────────────────────────────────────────
-    processed_root = run_pipeline(dataset_keys=["celebdf","ffpp","hidf","redface"])
+    processed_root = run_pipeline(dataset_keys=["celebdf","dff","ffpp","hidf","redface"])
 
     # ── tf.data 검증 ─────────────────────────────────────────────────────────
     if not any(Path(processed_root).rglob("*_face.jpg")):

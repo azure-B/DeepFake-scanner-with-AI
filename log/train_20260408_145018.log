@@ -1,0 +1,39 @@
+2026-04-08 14:50:22,226 [INFO] CLIP ViT-B/16 사용 가능
+2026-04-08 14:50:22,255 [INFO] GPU 1개 감지
+2026-04-08 14:50:22,255 [INFO] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA GeForce RTX 4060, compute capability 8.9
+2026-04-08 14:50:22,255 [INFO] compute dtype: float16
+2026-04-08 14:50:22,595 [INFO] ============================================================
+2026-04-08 14:50:22,595 [INFO] STEP 1: Train 데이터 수집
+2026-04-08 14:50:26,180 [INFO] [ffpp] real=40,844  fake=56,440
+2026-04-08 14:50:27,230 [INFO] [dff] real=8,054  fake=21,749
+2026-04-08 14:50:34,030 [INFO] [hidf] real=74,850  fake=120,318
+2026-04-08 14:50:34,078 [INFO] 전체: real=123,748  fake=198,507  total=322,255
+2026-04-08 14:50:34,080 [INFO] ============================================================
+2026-04-08 14:50:34,080 [INFO] STEP 2: 영상 ID 단위 분할
+2026-04-08 14:50:37,359 [INFO] [train] real=86,625  fake=138,984  total=225,609
+2026-04-08 14:50:37,370 [INFO] [val] real=12,164  fake=19,299  total=31,463
+2026-04-08 14:50:37,388 [INFO] [test] real=24,959  fake=40,224  total=65,183
+2026-04-08 14:50:37,394 [INFO] ============================================================
+2026-04-08 14:50:37,395 [INFO] STEP 3: 클래스 불균형 처리 (Undersample)
+2026-04-08 14:50:37,416 [INFO] 언더샘플: real=86,625  fake=86,625
+2026-04-08 14:50:37,426 [INFO] ============================================================
+2026-04-08 14:50:37,426 [INFO] STEP 4: External Test 데이터 수집
+2026-04-08 14:50:46,640 [INFO] [celebdf] real=26,391  fake=184,454
+2026-04-08 14:50:47,826 [INFO] [redface] real=7,411  fake=23,486
+2026-04-08 14:50:47,863 [INFO] 전체: real=33,802  fake=207,940  total=241,742
+2026-04-08 14:50:47,864 [INFO] ============================================================
+2026-04-08 14:50:47,864 [INFO] STEP 5: tf.data 파이프라인 빌드
+2026-04-08 14:50:49,466 [INFO] ============================================================
+2026-04-08 14:50:49,466 [INFO] STEP 6: 모델 빌드 (7-Head + Cross-Attention)
+2026-04-08 14:50:57,220 [INFO] Inner model params: 90,415,188
+2026-04-08 14:50:57,220 [INFO] ============================================================
+2026-04-08 14:50:57,220 [INFO] STEP 7: 컴파일
+2026-04-08 14:50:57,220 [INFO] Resume 모드: lr_init 3.00e-04 → 1.50e-05
+2026-04-08 14:50:57,226 [INFO] steps/epoch=10,828  total=541,400  warmup=54,140
+2026-04-08 14:50:57,226 [INFO] 가중치 로드: ./checkpoints\best_epoch014_valauc0.9139  (best_auc=0.9139)
+2026-04-08 14:50:57,628 [WARNING] Inconsistent references when loading the checkpoint into this object graph. For example, in the saved checkpoint object, `model.layer.weight` and `model.layer_copy.weight` reference the same variable, while in the current object these are two different variables. The referenced variables are:(<keras.layers.rnn.time_distributed.TimeDistributed object at 0x000001F5B1B0BA00> and <keras.layers.rnn.time_distributed.TimeDistributed object at 0x000001F5C25142B0>).
+2026-04-08 14:50:57,629 [WARNING] Inconsistent references when loading the checkpoint into this object graph. For example, in the saved checkpoint object, `model.layer.weight` and `model.layer_copy.weight` reference the same variable, while in the current object these are two different variables. The referenced variables are:(<keras.layers.rnn.time_distributed.TimeDistributed object at 0x000001F5C25142B0> and <keras.layers.rnn.time_distributed.TimeDistributed object at 0x000001F5C7018070>).
+2026-04-08 14:50:57,631 [WARNING] Inconsistent references when loading the checkpoint into this object graph. For example, in the saved checkpoint object, `model.layer.weight` and `model.layer_copy.weight` reference the same variable, while in the current object these are two different variables. The referenced variables are:(<keras.layers.normalization.layer_normalization.LayerNormalization object at 0x000001F5B5BF6640> and <__main__.BandPositionEmbedding object at 0x000001F5B6EFC5E0>).
+2026-04-08 14:50:57,632 [WARNING] Inconsistent references when loading the checkpoint into this object graph. For example, in the saved checkpoint object, `model.layer.weight` and `model.layer_copy.weight` reference the same variable, while in the current object these are two different variables. The referenced variables are:(<__main__.BandPositionEmbedding object at 0x000001F5B6EFC5E0> and <keras.layers.merging.add.Add object at 0x000001F5B8607370>).
+2026-04-08 14:50:57,635 [WARNING] Inconsistent references when loading the checkpoint into this object graph. For example, in the saved checkpoint object, `model.layer.weight` and `model.layer_copy.weight` reference the same variable, while in the current object these are two different variables. The referenced variables are:(<__main__.WavSubbandBlock object at 0x000001F548005D00> and <keras.layers.core.tf_op_layer.SlicingOpLambda object at 0x000001F5B99D3940>).
