@@ -1,0 +1,51 @@
+2026-04-09 12:32:17,215 [INFO] CLIP ViT-B/16 사용 가능
+2026-04-09 12:32:17,250 [INFO] GPU 1개 감지
+2026-04-09 12:32:17,250 [INFO] Mixed precision compatibility check (mixed_float16): OK
+Your GPU will likely run quickly with dtype policy mixed_float16 as it has compute capability of at least 7.0. Your GPU: NVIDIA GeForce RTX 4060, compute capability 8.9
+2026-04-09 12:32:17,250 [INFO] compute dtype: float16
+2026-04-09 12:32:17,705 [INFO] ============================================================
+2026-04-09 12:32:17,705 [INFO] STEP 1: Train 데이터 수집
+2026-04-09 12:32:21,475 [INFO] [ffpp] real=40,844  fake=56,440
+2026-04-09 12:32:23,050 [INFO] [dff] real=8,054  fake=21,749
+2026-04-09 12:32:29,444 [INFO] [hidf] real=74,850  fake=120,318
+2026-04-09 12:32:29,491 [INFO] 전체: real=123,748  fake=198,507  total=322,255
+2026-04-09 12:32:29,492 [INFO] ============================================================
+2026-04-09 12:32:29,492 [INFO] STEP 2: 영상 ID 단위 분할
+2026-04-09 12:32:31,495 [INFO] [train] real=86,625  fake=138,984  total=225,609
+2026-04-09 12:32:31,504 [INFO] [val] real=12,164  fake=19,299  total=31,463
+2026-04-09 12:32:31,519 [INFO] [test] real=24,959  fake=40,224  total=65,183
+2026-04-09 12:32:31,524 [INFO] ============================================================
+2026-04-09 12:32:31,524 [INFO] STEP 3: 클래스 불균형 처리 (Undersample)
+2026-04-09 12:32:31,539 [INFO] 언더샘플: real=86,625  fake=86,625
+2026-04-09 12:32:31,546 [INFO] ============================================================
+2026-04-09 12:32:31,546 [INFO] STEP 4: External Test 데이터 수집
+2026-04-09 12:32:37,497 [INFO] [celebdf] real=26,391  fake=184,454
+2026-04-09 12:32:38,714 [INFO] [redface] real=7,411  fake=23,486
+2026-04-09 12:32:38,752 [INFO] 전체: real=33,802  fake=207,940  total=241,742
+2026-04-09 12:32:38,753 [INFO] ============================================================
+2026-04-09 12:32:38,753 [INFO] STEP 5: tf.data 파이프라인 빌드
+2026-04-09 12:32:40,304 [INFO] ============================================================
+2026-04-09 12:32:40,304 [INFO] STEP 6: 모델 빌드 (7-Head + Cross-Attention)
+2026-04-09 12:32:47,152 [INFO] Inner model params: 90,415,188
+2026-04-09 12:32:47,152 [INFO] ============================================================
+2026-04-09 12:32:47,152 [INFO] STEP 7: 컴파일
+2026-04-09 12:32:47,157 [INFO] steps/epoch=10,828  total=541,400  warmup=54,140
+2026-04-09 12:32:47,157 [INFO] 새 학습 시작
+2026-04-09 12:32:47,157 [INFO] ============================================================
+2026-04-09 12:32:47,157 [INFO] STEP 8: 학습 시작
+2026-04-09 12:56:09,104 [INFO] Epoch 1 head_weights | rgb=0.523  wav=0.521  lm=0.523  rgb_wav=0.522  rgb_lm=0.524  wav_lm=0.522  all=0.523
+2026-04-09 12:56:09,111 [INFO] Epoch   1 │ loss=0.4457  auc=0.6429  val_loss=0.3813  val_auc=0.8474  lr=6.00e-05
+2026-04-09 13:19:34,891 [INFO] Epoch 2 head_weights | rgb=0.326  wav=0.321  lm=0.322  rgb_wav=0.325  rgb_lm=0.326  wav_lm=0.321  all=0.326
+2026-04-09 13:19:34,892 [INFO] Epoch   2 │ loss=0.3043  auc=0.7793  val_loss=0.2474  val_auc=0.8766  lr=1.20e-04
+2026-04-09 13:42:51,261 [INFO] Epoch 3 head_weights | rgb=0.165  wav=0.162  lm=0.162  rgb_wav=0.165  rgb_lm=0.165  wav_lm=0.162  all=0.165
+2026-04-09 13:42:51,262 [INFO] Epoch   3 │ loss=0.1943  auc=0.8044  val_loss=0.1439  val_auc=0.8983  lr=1.80e-04
+2026-04-09 14:06:13,979 [INFO] Epoch 4 head_weights | rgb=0.111  wav=0.110  lm=0.110  rgb_wav=0.111  rgb_lm=0.111  wav_lm=0.110  all=0.111
+2026-04-09 14:06:13,979 [INFO] Epoch   4 │ loss=0.1380  auc=0.8180  val_loss=0.1256  val_auc=0.8989  lr=2.40e-04
+2026-04-09 14:29:25,294 [INFO] Epoch 5 head_weights | rgb=0.101  wav=0.101  lm=0.101  rgb_wav=0.101  rgb_lm=0.101  wav_lm=0.101  all=0.101
+2026-04-09 14:29:25,294 [INFO] Epoch   5 │ loss=0.1236  auc=0.8273  val_loss=0.1229  val_auc=0.8939  lr=3.00e-04
+2026-04-09 14:52:33,223 [INFO] Epoch 6 head_weights | rgb=0.100  wav=0.100  lm=0.100  rgb_wav=0.100  rgb_lm=0.100  wav_lm=0.100  all=0.100
+2026-04-09 14:52:33,224 [INFO] Epoch   6 │ loss=0.1211  auc=0.8342  val_loss=0.1177  val_auc=0.9095  lr=3.00e-04
+2026-04-09 15:15:51,388 [INFO] Epoch 7 head_weights | rgb=0.100  wav=0.100  lm=0.100  rgb_wav=0.100  rgb_lm=0.100  wav_lm=0.100  all=0.100
+2026-04-09 15:15:51,389 [INFO] Epoch   7 │ loss=0.1201  auc=0.8437  val_loss=0.1221  val_auc=0.9084  lr=2.99e-04
+2026-04-09 15:38:53,476 [INFO] Epoch 8 head_weights | rgb=0.100  wav=0.100  lm=0.100  rgb_wav=0.100  rgb_lm=0.100  wav_lm=0.100  all=0.100
+2026-04-09 15:38:53,477 [INFO] Epoch   8 │ loss=0.1196  auc=0.8509  val_loss=0.1207  val_auc=0.9062  lr=2.97e-04

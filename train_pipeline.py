@@ -116,6 +116,14 @@ CFG = {
     "split_ratio"      : (0.7, 0.1, 0.2),
     "seed"             : 42,
 
+    # ── Phase 학습 ──────────────────────────────────────────
+    "wav_lm_pretrain_epochs": 5,  # Phase 1: wav/lm만 학습
+    "joint_train_epoch": 5,  # Phase 2: 전체 joint (CLIP freeze)
+    "unfreeze_epoch": 10,  # Phase 3: CLIP unfreeze (기존)
+
+    # wav/lm 별도 lr (CLIP보다 10배 높게)
+    "lr_wav_lm": 3e-3,
+
     # ── 저장
     "ckpt_dir"         : "./checkpoints",
 }
@@ -125,9 +133,9 @@ MEAN = tf.constant([0.48145466, 0.4578275,  0.40821073], dtype=tf.float32)
 STD  = tf.constant([0.26862954, 0.26130258, 0.27577711], dtype=tf.float32)
 
 LM_FEAT_DIM = 68
-HEAD_NAMES  = ["rgb", "dct", "lm", "rgb_dct", "rgb_lm", "dct_lm", "all"]
+HEAD_NAMES     = ["rgb", "wav", "lm", "rgb_wav", "rgb_lm", "wav_lm", "all"]
 AUX_HEAD_NAMES = ["aux_lf", "aux_hf"]
-
+ALL_EVAL_HEADS = HEAD_NAMES + AUX_HEAD_NAMES
 
 # ═══════════════════════════════════════════════════════════════
 # 1. 기하학적 랜드마크 피처 (34차원)
@@ -897,25 +905,33 @@ def build_head(feat, name, hidden, dropout, reg):
 # 6. Uncertainty Weights Layer
 # ═══════════════════════════════════════════════════════════════
 
-# ── UncertaintyWeights: get_log_var 제거, get_normalized_weights만 유지 ──
 class UncertaintyWeights(keras.layers.Layer):
     def __init__(self, head_names, **kwargs):
         super().__init__(name="uncertainty_weights", **kwargs)
         self.head_names = head_names
-
-        self.raw_weights = {
+        self.log_vars = {
             name: self.add_weight(
-                name=f"raw_w_{name}", shape=(),
+                name=f"log_var_{name}",
+                shape=(),
                 initializer=keras.initializers.Constant(0.0),
-                trainable=True, dtype=tf.float32,
+                trainable=True,
+                dtype=tf.float32,
             )
             for name in head_names
         }
 
+    def uncertainty_loss(self, focal_losses: dict) -> tf.Tensor:
+        total = tf.constant(0.0, dtype=tf.float32)
+        for name in self.head_names:
+            s  = self.log_vars[name]
+            fl = tf.cast(focal_losses[name], tf.float32)
+            total += 0.5 * tf.exp(-s) * fl + 0.5 * s
+        return total
+
     def get_normalized_weights(self):
-        raw = tf.stack([self.raw_weights[n] for n in self.head_names])
-        weights = tf.nn.sigmoid(raw) + 0.1
-        return {n: weights[i] for i, n in enumerate(self.head_names)}
+        raw    = {n: float(tf.exp(-self.log_vars[n]).numpy()) for n in self.head_names}
+        mean_w = sum(raw.values()) / len(raw)
+        return {n: v / mean_w for n, v in raw.items()}
 
     def call(self, inputs):
         return inputs
@@ -924,33 +940,6 @@ class UncertaintyWeights(keras.layers.Layer):
         cfg = super().get_config()
         cfg["head_names"] = self.head_names
         return cfg
-
-
-# ── _uncertainty_loss: softmax 가중치 사용으로 통일 ──
-def _uncertainty_loss(self, y_true, y_pred_dict):
-    total = tf.constant(0.0, dtype=tf.float32)
-    weights = self.uw_layer.get_normalized_weights()
-
-    for name in HEAD_NAMES:
-        fl = self._focal(y_true, y_pred_dict[name])
-        total += weights[name] * fl
-
-    for name in AUX_HEAD_NAMES:
-        total += self.aux_weight * self._focal(y_true, y_pred_dict[name])
-
-    return total
-
-
-# ── LogUncertaintyCallback: raw_weights 값 출력으로 변경 ──
-class LogUncertaintyCallback(keras.callbacks.Callback):
-    def on_epoch_end(self, epoch, logs=None):
-        w = self.model.uw_layer.get_normalized_weights()
-        log.info(
-            f"Epoch {epoch+1} head_weights | "
-            + "  ".join(f"{k}={float(v):.3f}" for k, v in w.items())
-        )
-
-
 
 # ═══════════════════════════════════════════════════════════════
 # 7. Inner Model (Functional API, 7 Dict Outputs)
@@ -1043,19 +1032,21 @@ class DeepfakeDetector(keras.Model):
         self.focal_alpha  = focal_alpha
         self.focal_gamma  = focal_gamma
         self.aux_weight   = aux_weight
+        self.train_phase  = tf.Variable(0, trainable=False, dtype=tf.int32)
+        # phase 0: wav/lm only
+        # phase 1: joint (CLIP frozen)
+        # phase 2: joint (CLIP unfrozen)
 
-        self.loss_tracker = keras.metrics.Mean(name="loss")
-        self.auc_metric   = keras.metrics.AUC(name="auc")
-        self.acc_metric   = keras.metrics.BinaryAccuracy(name="acc")
+        self.loss_tracker     = keras.metrics.Mean(name="loss")
+        self.auc_metric       = keras.metrics.AUC(name="auc")
+        self.acc_metric       = keras.metrics.BinaryAccuracy(name="acc")
         self.precision_metric = keras.metrics.Precision(name="precision")
-        self.recall_metric = keras.metrics.Recall(name="recall")
+        self.recall_metric    = keras.metrics.Recall(name="recall")
 
     @property
     def metrics(self):
-        return [
-            self.loss_tracker, self.auc_metric, self.acc_metric,
-            self.precision_metric, self.recall_metric
-        ]
+        return [self.loss_tracker, self.auc_metric, self.acc_metric,
+                self.precision_metric, self.recall_metric]
 
     def call(self, inputs, training=False):
         return self.inner_model(inputs, training=training)
@@ -1064,32 +1055,58 @@ class DeepfakeDetector(keras.Model):
         y_true = tf.cast(y_true, tf.float32)
         y_pred = tf.cast(y_pred, tf.float32)
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1.0 - 1e-7)
-        a      = y_true * self.focal_alpha + (1-y_true) * (1-self.focal_alpha)
-        p      = y_true * y_pred + (1-y_true) * (1-y_pred)
-        return tf.reduce_mean(
-            -a * tf.pow(1.0 - p, self.focal_gamma) * tf.math.log(p)
+        a = y_true * self.focal_alpha + (1 - y_true) * (1 - self.focal_alpha)
+        p = y_true * y_pred + (1 - y_true) * (1 - y_pred)
+        return tf.reduce_mean(-a * tf.pow(1.0 - p, self.focal_gamma) * tf.math.log(p))
+
+    def _uncertainty_loss(self, y_true, y_pred_dict, phase):
+        focal_losses = {
+            name: self._focal(y_true, y_pred_dict[name])
+            for name in HEAD_NAMES
+        }
+
+        def phase0_loss():
+            # ── 수정: wav/lm 헤드에 uncertainty weighting 적용 ──────
+            # rgb 관련 헤드는 stop_gradient로 log_var 학습에서 제외하되,
+            # wav/lm/wav_lm은 uncertainty loss에 태워 log_vars를 워밍업
+            WAV_LM_HEADS = ["wav", "lm", "wav_lm"]
+            total = tf.constant(0.0, dtype=tf.float32)
+            for name in HEAD_NAMES:
+                s = self.uw_layer.log_vars[name]
+                fl = tf.cast(focal_losses[name], tf.float32)
+                if name in WAV_LM_HEADS:
+                    # 정상 uncertainty loss → log_vars 학습
+                    total += 0.5 * tf.exp(-s) * fl + 0.5 * s
+                else:
+                    # RGB 관련: focal loss만, log_vars gradient는 stop
+                    total += tf.stop_gradient(tf.exp(-s)) * tf.stop_gradient(fl)
+            for name in AUX_HEAD_NAMES:
+                total += self.aux_weight * self._focal(y_true, y_pred_dict[name])
+            return total
+
+        def phase1_loss():
+            total = self.uw_layer.uncertainty_loss(focal_losses)
+            for name in AUX_HEAD_NAMES:
+                total += self.aux_weight * self._focal(y_true, y_pred_dict[name])
+            return total
+
+        return tf.cond(
+            tf.equal(phase, 0),
+            phase0_loss,
+            phase1_loss,
         )
-
-    def _uncertainty_loss(self, y_true, y_pred_dict):
-        total = tf.constant(0.0, dtype=tf.float32)
-        weights = self.uw_layer.get_normalized_weights()
-
-        for name in HEAD_NAMES:
-            fl = self._focal(y_true, y_pred_dict[name])
-            total += weights[name] * fl
-
-        for name in AUX_HEAD_NAMES:
-            total += self.aux_weight * self._focal(y_true, y_pred_dict[name])
-
-        return total
 
     def train_step(self, data):
         x, y = data
+        phase = self.train_phase
+
         with tf.GradientTape() as tape:
             y_pred = self(x, training=True)
-            loss = self._uncertainty_loss(y, y_pred)
-            scaled_loss = self.optimizer.get_scaled_loss(loss)  # ← 이제 정상 작동
+            loss = self._uncertainty_loss(y, y_pred, phase)
+            scaled_loss = self.optimizer.get_scaled_loss(loss)
 
+        # 변수 필터링 제거 — phase0_loss가 rgb를 포함 안 하므로
+        # rgb_branch gradient는 자동으로 0이 됨
         scaled_grads = tape.gradient(scaled_loss, self.trainable_variables)
         grads = self.optimizer.get_unscaled_gradients(scaled_grads)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
@@ -1103,18 +1120,57 @@ class DeepfakeDetector(keras.Model):
         return {m.name: m.result() for m in self.metrics}
 
     def test_step(self, data):
-        x, y   = data
+        x, y = data
         y_pred = self(x, training=False)
-        loss   = self._uncertainty_loss(y, y_pred)
+        loss = self._uncertainty_loss(y, y_pred, self.train_phase)
         y_hard = tf.cast(y >= 0.5, tf.float32)
-
         self.loss_tracker.update_state(loss)
         self.auc_metric.update_state(y_hard, y_pred["all"])
         self.acc_metric.update_state(y_hard, y_pred["all"])
         self.precision_metric.update_state(y_hard, y_pred["all"])
         self.recall_metric.update_state(y_hard, y_pred["all"])
-
         return {m.name: m.result() for m in self.metrics}
+
+class PhaseSchedulerCallback(keras.callbacks.Callback):
+    def __init__(self, wav_lm_pretrain_epochs, joint_train_epoch,
+                 steps_per_epoch, total_epochs, lr_min, cfg):
+        super().__init__()
+        self.phase0_end = wav_lm_pretrain_epochs
+        self.phase1_end = wav_lm_pretrain_epochs + joint_train_epoch
+        self.steps_per_epoch = steps_per_epoch
+        self.total_epochs = total_epochs
+        self.lr_min = lr_min
+        self.cfg = cfg
+
+    # 수정
+    def on_epoch_begin(self, epoch, logs=None):
+        if epoch < self.phase0_end:
+            self.model.train_phase.assign(0)
+            if epoch == 0:
+                log.info("🔵 Phase 0: wav/lm 전용 워밍업 시작")
+
+        elif self.phase0_end <= epoch < self.phase1_end:
+            if self.model.train_phase == 0:  # 처음 진입할 때만 lr 리셋
+                opt = self.model.optimizer
+                inner = opt.inner_optimizer if hasattr(opt, "inner_optimizer") else opt
+                remaining = self.total_epochs - epoch
+                inner.learning_rate = WarmupCosineDecay(
+                    lr_init=self.cfg["lr_init"],
+                    lr_min=self.lr_min,
+                    warmup_steps=self.steps_per_epoch * 2,
+                    total_steps=self.steps_per_epoch * remaining,
+                )
+                log.info(f"🟡 Phase 1: Joint 학습 시작 (Epoch {epoch})")
+            self.model.train_phase.assign(1)
+
+        else:  # epoch >= self.phase1_end
+            self.model.train_phase.assign(2)
+            if epoch == self.phase1_end:
+                log.info(f"🟢 Phase 2: CLIP Unfreeze 준비 (Epoch {epoch})")
+
+    def on_epoch_end(self, epoch, logs=None):
+        phase = int(self.model.train_phase.numpy())
+        log.info(f"  현재 Phase: {phase}")
 
 # ═══════════════════════════════════════════════════════════════
 # 9. 학습률 스케줄러
@@ -1243,34 +1299,46 @@ def _get_lr(model):
     return float(sched)
 
 
-def build_callbacks(cfg: dict, model, initial_best_auc=None) -> list:
+def build_callbacks(cfg, model, steps_per_epoch, initial_best_auc=None):
     os.makedirs(cfg["ckpt_dir"], exist_ok=True)
+
+    class BranchHealthCallback(keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            lv = {n: float(self.model.uw_layer.log_vars[n].numpy())
+                  for n in self.model.uw_layer.head_names}
+            w = self.model.uw_layer.get_normalized_weights()
+            log.info("log_var | " + "  ".join(f"{k}={v:+.3f}" for k, v in lv.items()))
+            log.info("eff_w   | " + "  ".join(f"{k}={v:.3f}"  for k, v in w.items()))
+
     return [
         keras.callbacks.ModelCheckpoint(
-            filepath=os.path.join(
-                cfg["ckpt_dir"],
-                "best_epoch{epoch:03d}_valauc{val_auc:.4f}",
-            ),
-            monitor="val_auc",
-            mode="max",
-            save_best_only=True,
-            save_weights_only=True,
-            verbose=1,
+            filepath=os.path.join(cfg["ckpt_dir"],
+                                  "best_epoch{epoch:03d}_valauc{val_auc:.4f}"),
+            monitor="val_auc", mode="max",
+            save_best_only=True, save_weights_only=True, verbose=1,
         ),
         SmartEarlyStopping(
             initial_best=initial_best_auc,
-            monitor="val_auc",
-            mode="max",
-            patience=25,
-            restore_best_weights=True,
-            verbose=1,
-            min_delta=0.001,
+            monitor="val_auc", mode="max",
+            patience=25, restore_best_weights=True,
+            verbose=1, min_delta=0.001,
+        ),
+        PhaseSchedulerCallback(          # ← BackboneUnfreezeCallback 대체
+            wav_lm_pretrain_epochs = cfg["wav_lm_pretrain_epochs"],
+            joint_train_epoch      = cfg["joint_train_epoch"],
+            steps_per_epoch        = steps_per_epoch,
+            total_epochs           = cfg["epochs"],
+            lr_min                 = cfg["lr_min"],
+            cfg                    = cfg,
         ),
         BackboneUnfreezeCallback(
-            unfreeze_epoch = cfg["unfreeze_epoch"],
-            lr_scale       = 0.01,  # CLIP fine-tune은 lr 매우 작게
+            unfreeze_epoch  = cfg["unfreeze_epoch"],
+            lr_scale        = 0.01,
+            steps_per_epoch = steps_per_epoch,
+            total_epochs    = cfg["epochs"],
+            lr_min          = cfg["lr_min"],
         ),
-        LogUncertaintyCallback(),
+        BranchHealthCallback(),
         keras.callbacks.LambdaCallback(
             on_epoch_end=lambda epoch, logs: log.info(
                 f"Epoch {epoch+1:3d} │ "
@@ -1282,16 +1350,10 @@ def build_callbacks(cfg: dict, model, initial_best_auc=None) -> list:
             )
         ),
     ]
-
-
 # ═══════════════════════════════════════════════════════════════
 # 11. 평가 — Ablation Table 자동 생성
 # ═══════════════════════════════════════════════════════════════
 
-# 수정
-HEAD_NAMES = ["rgb", "wav", "lm", "rgb_wav", "rgb_lm", "wav_lm", "all"]
-AUX_HEAD_NAMES = ["aux_lf", "aux_hf"]
-ALL_EVAL_HEADS = HEAD_NAMES + AUX_HEAD_NAMES
 
 def evaluate_model(model: DeepfakeDetector, test_ds, tag="Test", n_tta=8):
     preds_all  = {name: [] for name in ALL_EVAL_HEADS}
@@ -1475,7 +1537,7 @@ def main():
         validation_data=val_ds,
         epochs=cfg["epochs"],
         initial_epoch=initial_epoch,
-        callbacks=build_callbacks(cfg, model, initial_best_auc),  # ← 전달
+        callbacks=build_callbacks(cfg, model, steps_per_epoch, initial_best_auc),  # ← 전달
         verbose=1,
     )
     log.info(f"학습 완료 — {(time.time() - t0) / 3600:.2f}h")
